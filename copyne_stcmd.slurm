@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH -J copyloss_ctcatt_st-cmd
+#SBATCH -p batch
+#SBATCH -N 1
+#SBATCH -o /public/home/gongchen18/slzhou/speech_help_ner/asr_help_ner/job-copyloss_ctcatt_st-cmd.%j.out
+#SBATCH -e /public/home/gongchen18/slzhou/speech_help_ner/asr_help_ner/job-copyloss_ctcatt_st-cmd.%j.error
+#SBATCH --gres=gpu:1
+#SBATCH -n 6
+#SBATCH -x comput8
+
+source /public/home/gongchen18/anaconda3/bin/activate
+conda activate wenet
+
+python -m main train --train data/st-cmd/train_addne.json \
+                     --dev data/st-cmd/dev_addne.json \
+                     --test data/st-cmd/test_addne.json \
+                     --add_context \
+                     --pad_context 3 \
+                     --att_type simpleatt \
+                     --add_copy_loss \
+                     --train_ne_dict data/st-cmd/train_ner_minlen2.vocab \
+                     --dev_ne_dict data/st-cmd/dev_ner_minlen2.vocab \
+                     --path exp/debug_copyloss_ctcatt_st-cmd/ \
+                     --batch_size 64 \
+                     --seed 777 \
+                     --config conf/copyne.yaml \
+                     --char_dict data/st-cmd/st-cmd-char.vocab \
+                     --cmvn data/st-cmd/global_cmvn \
+                     --num_workers 6 \
+                     --device 0

@@ -1,0 +1,25 @@
+# data
+data
+
+# exp
+exp
+
+# py cache
+__pycache__
+
+# sh
+run.sh
+
+# res file
+*.asr
+*.pred
+*.wer
+*.all
+*.error
+*.out
+*.txt
+*.log
+
+# self file
+ter_job.sh
+batch_decode.sh
