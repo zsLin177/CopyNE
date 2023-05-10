@@ -623,7 +623,7 @@ class CLASDataset(Dataset):
         else:
             sentence = self.data[index]["ner_txt"]
 
-        ne_set = set([sentence[st: ed+1] for ne_label, st, ed in self.data[index]["ne_lst"]])
+        ne_set = set([sentence[st: ed+1] for ne_label, st, ed in self.data[index]["ne_lst"] if ed > st])
 
         key = self.data[index]["key"]
 
