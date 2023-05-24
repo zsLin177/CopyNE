@@ -220,6 +220,7 @@ class ContextualTransformerDecoder(torch.nn.Module):
         cocoder_out_dim: int = 512,
         conatt_type: str='contextual',
         add_copy_loss: bool = False,
+        no_concat: bool = False,
     ):
         assert check_argument_types()
         super().__init__()
@@ -228,6 +229,7 @@ class ContextualTransformerDecoder(torch.nn.Module):
         self.contextual_att = contextual_att
         self.conatt_type = conatt_type
         self.add_copy_loss = add_copy_loss
+        self.concat = not no_concat
 
         self.symbol_table = symbol_table
         self.left_lst = [value for key, value in self.symbol_table.items() if key in ['(', '<', '[']]
@@ -255,7 +257,10 @@ class ContextualTransformerDecoder(torch.nn.Module):
                 self.output_layer = torch.nn.Linear(attention_dim+attention_dim, vocab_size)
             elif conatt_type == 'simpleatt':
                 self.conatt = SimpleAttention(decoder_dim=attention_dim, cocoder_dim=cocoder_out_dim)
-                self.output_layer = torch.nn.Linear(attention_dim+cocoder_out_dim, vocab_size)
+                if self.concat:
+                    self.output_layer = torch.nn.Linear(attention_dim+cocoder_out_dim, vocab_size)
+                else:
+                    self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
             else:
                 raise ValueError(f'No this att type: {conatt_type}!')
         self.num_blocks = num_blocks
@@ -330,7 +335,10 @@ class ContextualTransformerDecoder(torch.nn.Module):
             #     x = self.output_layer(torch.cat((x, context_repr), -1))
             # elif self.conatt_type == 'crossatt':
                 # x = self.output_layer(context_repr)
-            x = self.output_layer(torch.cat((x, context_repr), -1))
+            if self.concat:
+                x = self.output_layer(torch.cat((x, context_repr), -1))
+            else:
+                x = self.output_layer(x)
             
         olens = tgt_mask.sum(1)
         if not self.add_copy_loss:
@@ -392,7 +400,10 @@ class ContextualTransformerDecoder(torch.nn.Module):
             context_repr = context_repr.squeeze(1)
         if self.use_output_layer:
             if not copy_forward:
-                y = torch.log_softmax(self.output_layer(torch.cat((y, context_repr), -1)), dim=-1)
+                if self.concat:
+                    y = torch.log_softmax(self.output_layer(torch.cat((y, context_repr), -1)), dim=-1)
+                else:
+                    y = torch.log_softmax(self.output_layer(y), dim=-1)
                 # else:
                 #     # (batch*beam, n_char)
                 #     att_score = self.output_layer(y)
@@ -410,7 +421,10 @@ class ContextualTransformerDecoder(torch.nn.Module):
                 all_att[threshold_mask.nonzero().squeeze(-1), 0:-1] = 0.0
                 all_att[threshold_mask.nonzero().squeeze(-1), -1] = 1.0
                 # (batch*beam, n_char)
-                y = self.output_layer(torch.cat((y, context_repr), -1)).softmax(-1)
+                if self.concat:
+                    y = self.output_layer(torch.cat((y, context_repr), -1)).softmax(-1)
+                else:
+                    y = self.output_layer(y).softmax(-1)
                 y = all_att[:, -1].unsqueeze(-1) * y
                 # [batch*beam, n_char+n_v-1]
                 y = torch.cat((y, all_att[:, 0:-1]), -1).log()

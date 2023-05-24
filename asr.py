@@ -1227,6 +1227,7 @@ class CopyNEASRParser(object):
         configs['symbol_table'] = self.symbol_vocab
         configs['att_type'] = args.att_type
         configs['add_copy_loss'] = args.add_copy_loss
+        configs['no_concat'] = args.no_concat
         self.configs = configs
 
         self.model = init_asr_model(configs)

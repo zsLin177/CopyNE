@@ -1,12 +1,11 @@
 #!/bin/bash
-#SBATCH -J copyne_st-cmd
+#SBATCH -J copyloss_ctcatt_st-cmd
 #SBATCH -p batch
 #SBATCH -N 1
-#SBATCH -o /public/home/gongchen18/slzhou/speech_help_ner/asr_help_ner/job-copyloss_ctcatt_st-cmd.%j.out
-#SBATCH -e /public/home/gongchen18/slzhou/speech_help_ner/asr_help_ner/job-copyloss_ctcatt_st-cmd.%j.error
-#SBATCH --gres=gpu:1
+#SBATCH -o /public/home/gongchen18/slzhou/speech_help_ner/asr_help_ner/job-copyne_st-cmd.%j.out
+#SBATCH -e /public/home/gongchen18/slzhou/speech_help_ner/asr_help_ner/job-copyne_st-cmd.%j.error
+#SBATCH --gres=gpu:NVIDIAA100-PCIE-40GB:1
 #SBATCH -n 6
-#SBATCH -x comput8
 
 source /public/home/gongchen18/anaconda3/bin/activate
 conda activate wenet
@@ -20,7 +19,8 @@ python -m main train --train data/st-cmd/train_addne.json \
                      --add_copy_loss \
                      --train_ne_dict data/st-cmd/train_ner_minlen2.vocab \
                      --dev_ne_dict data/st-cmd/dev_ner_minlen2.vocab \
-                     --path exp/debug_copyloss_ctcatt_st-cmd/ \
+                     --no_concat \
+                     --path exp/copyne_ctcatt_st-cmd_nocat/ \
                      --batch_size 64 \
                      --seed 777 \
                      --config conf/copyne.yaml \

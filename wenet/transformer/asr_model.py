@@ -1397,8 +1397,8 @@ def init_asr_model(configs):
         #     torch.from_numpy(mean).float(),
         #     torch.from_numpy(istd).float())
         global_cmvn = GlobalCMVN(
-            torch.tensor(mean),
-            torch.tensor(istd))
+            torch.tensor(mean).float(),
+            torch.tensor(istd).float())
     else:
         global_cmvn = None
 
@@ -1427,7 +1427,7 @@ def init_asr_model(configs):
     elif decoder_type == 'conattransformer':
         symbol_table = configs.pop('symbol_table')
         att_type = configs.pop('att_type')
-        decoder = ContextualTransformerDecoder(vocab_size, encoder.output_size(), symbol_table, conatt_type=att_type, add_copy_loss=add_copy_loss,**configs['decoder_conf'])
+        decoder = ContextualTransformerDecoder(vocab_size, encoder.output_size(), symbol_table, conatt_type=att_type, add_copy_loss=add_copy_loss, no_concat=configs['no_concat'], **configs['decoder_conf'])
     else:
         assert 0.0 < configs['model_conf']['reverse_weight'] < 1.0
         assert configs['decoder_conf']['r_num_blocks'] > 0
@@ -1448,8 +1448,8 @@ def init_copyasr_model(configs):
     if configs['cmvn_file'] is not None:
         mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
         global_cmvn = GlobalCMVN(
-            torch.tensor(mean),
-            torch.tensor(istd))
+            torch.tensor(mean).float(),
+            torch.tensor(istd).float())
     else:
         global_cmvn = None
 
@@ -1490,8 +1490,8 @@ def init_encoder(configs):
     if configs['cmvn_file'] is not None:
         mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
         global_cmvn = GlobalCMVN(
-            torch.from_numpy(mean).float(),
-            torch.from_numpy(istd).float())
+            torch.tensor(mean).float(),
+            torch.tensor(istd).float())
     else:
         global_cmvn = None
 
@@ -1716,8 +1716,8 @@ def init_ctc_model(configs):
     if configs['cmvn_file'] is not None:
         mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
         global_cmvn = GlobalCMVN(
-            torch.from_numpy(mean).float(),
-            torch.from_numpy(istd).float())
+            torch.tensor(mean).float(),
+            torch.tensor(istd).float())
     else:
         global_cmvn = None
     

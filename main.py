@@ -60,6 +60,8 @@ def parse(parser):
     parser.add_argument('--dev_ne_dict', default='data/end2end/aishell_dev_ner_random-500.vocab')
     parser.add_argument('--att_type', default='contextual', type=str, choices=['contextual', 'crossatt', 'simpleatt'])
     parser.add_argument('--add_copy_loss', action='store_true')
+    parser.add_argument('--no_concat', action='store_true')
+
     
 
     args, unknown = parser.parse_known_args()
