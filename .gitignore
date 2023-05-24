@@ -19,6 +19,9 @@ run.sh
 *.out
 *.txt
 *.log
+*.cer
+*.ne-cer
+*.text
 
 # self file
 ter_job.sh
