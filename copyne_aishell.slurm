@@ -14,12 +14,12 @@ python -m main train --train data/end2end/train_addne.json \
                      --dev data/end2end/dev_addne.json \
                      --test data/end2end/test_addne.json \
                      --add_context \
-                     --pad_context 3 \
+                     --pad_context 4 \
                      --att_type simpleatt \
                      --add_copy_loss \
                      --train_ne_dict data/end2end/vocab/aishell_train_ner_minlen2_most-all.vocab \
                      --dev_ne_dict data/end2end/vocab/aishell_dev_ner_minlen2_most-all.vocab \
-                     --path exp/copyne_aishell/ \
+                     --path exp/copyne_aishell_beta3/ \
                      --batch_size 64 \
                      --seed 777 \
                      --config conf/copyne.yaml \

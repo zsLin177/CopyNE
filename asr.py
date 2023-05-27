@@ -1412,12 +1412,12 @@ class CopyNEASRParser(object):
         eos = len(char_dict) - 1
         special_brackets = ['(', ')', '<', '>', '[', ']', '$']
         bar = progress_bar(dataloader)
-        all_res_file = self.args.res + '.all'
+        # all_res_file = self.args.res + '.all'
         asr_res_file = self.args.res + '.asr'
         if is_test:
             context = self.model.concoder(self.test_context_tensor)
         start = datetime.now()
-        with open(all_res_file, 'w') as fout, open(asr_res_file, 'w') as fasr:
+        with open(asr_res_file, 'w') as fasr:
             for i, dic in enumerate(bar, 1):
                 audio_feat = dic['audio_feat']
                 asr_target = dic['asr_target']
@@ -1478,13 +1478,13 @@ class CopyNEASRParser(object):
                             content.append("淦")
                         else:
                             content.append(char_dict[w])
-                    all_res = ''.join(content)
+                    # all_res = ''.join(content)
                     asr_res = ''.join(content)
                     for bracket in special_brackets:
                         asr_res = asr_res.replace(bracket, '')
 
-                    logger.info('{}   {}   {}'.format(key, all_res, asr_res))
-                    fout.write('{} {}\n'.format(key, all_res))
+                    logger.info('{}\t{}'.format(key, asr_res))
+                    # fout.write('{} {}\n'.format(key, all_res))
                     fasr.write('{} {}\n'.format(key, asr_res))
         elapsed = datetime.now() - start
         print(f"{elapsed}s elapsed, {len(dataset) / elapsed.total_seconds():.2f} Sents/s")
