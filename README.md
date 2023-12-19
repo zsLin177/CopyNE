@@ -75,8 +75,8 @@ python -m main evaluate --char_dict data_to_upload/aishell_vocab/char.vocab \
 ```
 
 ## Acknowledge
-1. We borrowed some code from [wenet](https://github.com/wenet-e2e/wenet) for speech processing and modeling.
-2. We borrowed some code from [supar](https://github.com/yzhangcs/parser) for the some tensor operations.
+1. We borrowed some code from [wenet](https://github.com/wenet-e2e/wenet) for some speech processing and modeling.
+2. We borrowed some code from [supar](https://github.com/yzhangcs/parser) for some tensor operations.
 
 ## Citation
 If you find this repo helpful, please cite the following paper:
