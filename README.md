@@ -28,6 +28,8 @@ cd ..
 python scripts/change_wav_path.py data_to_upload/aishell_dataset/train_addne.json data_to_upload
 python scripts/change_wav_path.py data_to_upload/aishell_dataset/dev_addne.json data_to_upload
 python scripts/change_wav_path.py data_to_upload/aishell_dataset/test_addne.json data_to_upload
+python scripts/change_wav_path.py data_to_upload/aishell_dataset/dev-ne.json data_to_upload
+python scripts/change_wav_path.py data_to_upload/aishell_dataset/test-ne.json data_to_upload
 ```
 
 ## Training
