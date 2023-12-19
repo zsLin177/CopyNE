@@ -30,7 +30,7 @@ def parse(parser):
                         default='data/sp_ner/chinese_char.txt', 
                         help='path to the char dict file')
     parser.add_argument('--cmvn', 
-                        default='data/sp_ner/global_cmvn_mel80', 
+                        default='data_to_upload/aishell1_global_cmvn_mel80', 
                         help='global cmvn file')
     parser.add_argument('--config', 
                         default='conf/ctc_mel80.yaml', 
