@@ -72,3 +72,18 @@ python -m main evaluate --char_dict data_to_upload/aishell_vocab/char.vocab \
 ./compute-necer.sh data_to_upload/aishell_dataset/test-ne.text test-ne.pred.asr
 ```
 
+## Acknowledge
+1. We borrowed some code from [wenet](https://github.com/wenet-e2e/wenet) for speech processing and modeling.
+2. We borrowed some code from [supar](https://github.com/yzhangcs/parser) for the some tensor operations.
+
+## Citation
+If you find this repo helpful, please cite the following paper:
+```bibtex
+@article{zhou2023copyne,
+  title={CopyNE: Better Contextual ASR by Copying Named Entities},
+  author={Zhou, Shilin and Li, Zhenghua and Hong, Yu and Zhang, Min and Wang, Zhefeng and Huai, Baoxing},
+  journal={arXiv preprint arXiv:2305.12839},
+  year={2023}
+}
+```
+
