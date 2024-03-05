@@ -1,12 +1,13 @@
 import argparse
 
-from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParser
+from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParser, ParaformerASRParser
 from supar.utils.logging import init_logger, logger
 import os
 import torch
 import random
 
 def parse(parser):
+    parser.add_argument('--type', choices=["paraformer", "other"])
     parser.add_argument('--path', help='path to model file')
     parser.add_argument('--device',
                         default='-1',
@@ -73,7 +74,10 @@ def parse(parser):
 
     if args.mode == 'train':
         if not args.add_context:
-            parser = CTCAttentionASRParser(args)
+            if args.type == 'other':
+                parser = CTCAttentionASRParser(args)
+            elif args.type == 'paraformer':
+                parser = ParaformerASRParser(args)
         else:
             if not args.add_copy_loss:
                 parser = CLASCTCAttentionASRParser(args)
@@ -83,7 +87,10 @@ def parse(parser):
         parser.train()
     elif args.mode == 'evaluate':
         if not args.add_context:
-            parser = CTCAttentionASRParser(args)
+            if args.type == 'other':
+                parser = CTCAttentionASRParser(args)
+            elif args.type == 'paraformer':
+                parser = ParaformerASRParser(args)
         else:
             if not args.add_copy_loss:
                 parser = CLASCTCAttentionASRParser(args)

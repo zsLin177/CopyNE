@@ -576,7 +576,6 @@ class CopyTransformerDecoder(torch.nn.Module):
         else:
             return embed_score.log_softmax(-1), new_cache
 
-
 class BiTransformerDecoder(torch.nn.Module):
     """Base class of Transfomer decoder module.
     Args:
@@ -690,6 +689,89 @@ class BiTransformerDecoder(torch.nn.Module):
         return self.left_decoder.forward_one_step(memory, memory_mask, tgt,
                                                   tgt_mask, cache)
 
+class ParaformerDecoder(torch.nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        encoder_output_size: int,
+        attention_heads: int = 4,
+        linear_units: int = 2048,
+        num_blocks: int = 6,
+        dropout_rate: float = 0.1,
+        positional_dropout_rate: float = 0.1,
+        self_attention_dropout_rate: float = 0.0,
+        src_attention_dropout_rate: float = 0.0,
+        input_layer: str = "embed",
+        use_output_layer: bool = True,
+        normalize_before: bool = True,
+        concat_after: bool = False,
+    ):
+        assert check_argument_types()
+        super().__init__()
+        attention_dim = encoder_output_size
+        self.attention_dim = attention_dim
+        if input_layer == "embed":
+            self.embed = torch.nn.Sequential(
+                torch.nn.Embedding(vocab_size, attention_dim),
+                PositionalEncoding(attention_dim, positional_dropout_rate),
+            )
+        else:
+            raise ValueError(f"only 'embed' is supported: {input_layer}")
+        self.normalize_before = normalize_before
+        self.after_norm = torch.nn.LayerNorm(attention_dim, eps=1e-5)
+        self.use_output_layer = use_output_layer
+        self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
+        self.num_blocks = num_blocks
+        self.decoders = torch.nn.ModuleList([
+            DecoderLayer(
+                attention_dim,
+                MultiHeadedAttention(attention_heads, attention_dim,
+                                     self_attention_dropout_rate),
+                MultiHeadedAttention(attention_heads, attention_dim,
+                                     src_attention_dropout_rate),
+                PositionwiseFeedForward(attention_dim, linear_units,
+                                        dropout_rate),
+                dropout_rate,
+                normalize_before,
+                concat_after,
+            ) for _ in range(self.num_blocks)
+        ])
+    
+    def forward(
+            self,
+            x: torch.Tensor,
+            x_mask: torch.Tensor,
+            memory: torch.Tensor,
+            memory_mask: torch.Tensor,
+    ):
+        """
+        Args:
+            token-level input x from predictor or sampler: (batch, T, feat)
+            x_mask: (batch, T)
+            memory: encoded memory, float32  (batch, S, feat)
+            memory_mask: encoder memory mask, (batch, S)
+        Returns:
+            (tuple): tuple containing:
+                y: decoded token score before softmax (batch, T,
+                    vocab_size) if use_output_layer is True,
+                olens: (batch, )
+        """
+        # form the shape of masks
+        # [batch, T, T]
+        x_mask = x_mask.unsqueeze(1) & x_mask.unsqueeze(2)
+        # [batch, 1, S]
+        memory_mask = memory_mask.unsqueeze(1)
+
+        for layer in self.decoders:
+            x, x_mask, memory, memory_mask = layer(x, x_mask, memory, memory_mask)
+        if self.normalize_before:
+            x = self.after_norm(x)
+        if self.use_output_layer:
+            # [batch, T, vocab_size]
+            x = self.output_layer(x)
+        olens = x_mask.sum(1)
+        return x, olens
+        
 
 def get_need_att_mask(left_id_lst, right_id_lst, ids):
     """

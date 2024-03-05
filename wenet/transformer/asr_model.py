@@ -26,9 +26,11 @@ from wenet.transformer.ctc import CTC
 from wenet.transformer.decoder import (TransformerDecoder,
                                        BiTransformerDecoder,
                                        ContextualTransformerDecoder,
-                                       CopyTransformerDecoder)
+                                       CopyTransformerDecoder,
+                                       ParaformerDecoder)
 from wenet.transformer.encoder import ConformerEncoder
 from wenet.transformer.encoder import TransformerEncoder
+from wenet.transformer.cif_predictor import CifPredictor, mae_loss
 from wenet.transformer.label_smoothing_loss import LabelSmoothingLoss
 from wenet.utils.cmvn import load_cmvn
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
@@ -38,6 +40,7 @@ from wenet.utils.mask import (make_pad_mask, mask_finished_preds,
                               mask_finished_scores, subsequent_mask)
 from model.contextual_encoder import LSTMContextCoder, TransformerContextCoder
 from supar.utils.fn import pad
+
 
 class ASRModel(torch.nn.Module):
     """CTC-attention hybrid Encoder-Decoder model"""
@@ -949,7 +952,6 @@ class ASRModel(torch.nn.Module):
         r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
         return decoder_out, r_decoder_out
 
-
 class CopyASRModel(torch.nn.Module):
     """CTC-attention hybrid Encoder-Decoder model with copy mechanism"""
     def __init__(
@@ -1390,6 +1392,202 @@ class CopyASRModel(torch.nn.Module):
         n_real_len = n_real_hyps.ne(-1).sum(-1)
         return n_real_hyps, n_real_len
 
+class ParaformerASRModel(torch.nn.Module):
+    """
+    Implementation of ParaformerASRModel
+    Author: Speech Lab of DAMO Academy, Alibaba Group
+    Paraformer: Fast and Accurate Parallel Transformer for Non-autoregressive End-to-End Speech Recognition
+    https://arxiv.org/abs/2206.08317
+    """
+    def __init__(self, 
+                 vocab_size: int,
+                 encoder: TransformerEncoder,
+                 decoder: ParaformerDecoder,
+                 predictor: CifPredictor,
+                 predictor_weight: float = 1.0,
+                 predictor_bias: int = 0,
+                 sampling_ratio: float = 0.4,
+                 ignore_id: int = IGNORE_ID,
+                 lsm_weight: float = 0.0,
+                 length_normalized_loss: bool = False,
+                ):
+        super().__init__()
+        # note that eos is the same as sos (equivalent ID)
+        self.sos = vocab_size - 1
+        self.eos = vocab_size - 1
+        self.vocab_size = vocab_size
+        self.ignore_id = ignore_id
+        self.encoder = encoder
+        self.decoder = decoder
+        self.predictor = predictor
+        self.predictor_weight = predictor_weight
+        self.predictor_bias = predictor_bias
+        self.sampling_ratio = sampling_ratio
+        self.length_normalized_loss = length_normalized_loss
+
+        self.criterion_att = LabelSmoothingLoss(
+            size=vocab_size,
+            padding_idx=ignore_id,
+            smoothing=lsm_weight,
+            normalize_length=length_normalized_loss,
+        )
+
+        self.criterion_pre = mae_loss(normalize_length=length_normalized_loss)
+
+    def forward(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+    ):
+        """Encoder + Decoder + Calc loss
+        Args:
+                speech: (Batch, Length, ...)
+                speech_lengths: (Batch, )
+                text: (Batch, Length)
+                text_lengths: (Batch,)
+        """
+        assert text_lengths.dim() == 1, text_lengths.shape
+        # Check that batch_size is unified
+        assert (speech.shape[0] == speech_lengths.shape[0] == text.shape[0] == text_lengths.shape[0]), (speech.shape, speech_lengths.shape,
+                                         text.shape, text_lengths.shape)
+        # 1. Encoder
+        # encoder_out: (B, T, encoder_dim), encoder_mask: (B, 1, T)
+        encoder_out, encoder_mask = self.encoder(speech, speech_lengths)
+        # encoder_out_lens: (B, )
+        encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+        # 2. Decoder
+        loss_att, loss_pre = self._calc_att_loss(encoder_out, encoder_mask, text, text_lengths)
+        loss = loss_att + self.predictor_weight * loss_pre
+        return loss, loss_att, loss_pre
+    
+    def _calc_att_loss(
+            self,
+            encoder_out: torch.Tensor,
+            encoder_mask: torch.Tensor,
+            ys_pad: torch.Tensor,
+            ys_pad_lens: torch.Tensor,
+    ):
+        """
+        Args:
+            encoder_out: (B, T, encoder_dim)
+            encoder_mask: (B, 1, T)
+            ys_pad: (B, L)
+            ys_pad_lens: (B, )
+        """
+        encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+        if self.predictor_bias == 1:
+            _, ys_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
+            ys_pad_lens = ys_pad_lens + self.predictor_bias
+        
+        # pred: (B, L, dim)
+        pre_acoustic_embeds, pre_token_length, _, pre_peak_index = self.predictor(encoder_out, ys_pad, encoder_mask,               ignore_id=self.ignore_id)
+
+        # 0. sampler
+        decoder_out_1st = None
+        pre_loss_att = None
+        if self.sampling_ratio > 0.0:
+            sematic_embeds, decoder_out_1st = self.sampler(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds)
+        else:
+            sematic_embeds = pre_acoustic_embeds
+
+        # 1. Forward decoder
+        tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())).to(ys_pad.device)
+        decoder_outs = self.decoder(sematic_embeds, tgt_mask, encoder_out, encoder_mask.squeeze(1))
+        decoder_out, _ = decoder_outs[0], decoder_outs[1]
+        if decoder_out_1st is None:
+            decoder_out_1st = decoder_out
+        
+        # 2. Compute attention loss
+        loss_att = self.criterion_att(decoder_out, ys_pad)
+        loss_pre = self.criterion_pre(ys_pad_lens.type_as(pre_token_length), pre_token_length)
+
+        return loss_att, loss_pre
+
+    def sampler(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds):
+        tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())[:, :, None]).to(ys_pad.device)
+        ys_pad_masked = ys_pad * tgt_mask[:, :, 0]
+
+        ys_pad_embed, _ = self.decoder.embed(ys_pad_masked)
+
+        with torch.no_grad():
+            decoder_outs = self.decoder(
+                pre_acoustic_embeds, tgt_mask.squeeze(-1), encoder_out, encoder_mask.squeeze(1))
+            decoder_out, _ = decoder_outs[0], decoder_outs[1]
+            pred_tokens = decoder_out.argmax(-1)
+            nonpad_positions = ys_pad.ne(self.ignore_id)
+            seq_lens = (nonpad_positions).sum(1)
+            same_num = ((pred_tokens == ys_pad) & nonpad_positions).sum(1)
+            input_mask = torch.ones_like(nonpad_positions)
+            bsz, seq_len = ys_pad.size()
+            for li in range(bsz):
+                target_num = (((seq_lens[li] - same_num[li].sum()).float()) * self.sampling_ratio).long()
+                if target_num > 0:
+                    input_mask[li].scatter_(dim=0,
+                                            index=torch.randperm(seq_lens[li])[:target_num].to(input_mask.device),
+                                            value=0)
+            input_mask = input_mask.eq(1)
+            input_mask = input_mask.masked_fill(~nonpad_positions, False)
+            input_mask_expand_dim = input_mask.unsqueeze(2).to(pre_acoustic_embeds.device)
+        sematic_embeds = pre_acoustic_embeds.masked_fill(~input_mask_expand_dim, 0) + ys_pad_embed.masked_fill(
+            input_mask_expand_dim, 0)
+        return sematic_embeds * tgt_mask, decoder_out * tgt_mask
+    
+    def calc_predictor(self, encoder_out, encoder_out_lens):
+        
+        encoder_out_mask = (~make_pad_mask(encoder_out_lens, max_len=encoder_out.size(1))[:, None, :]).to(
+            encoder_out.device)
+        pre_acoustic_embeds, pre_token_length, alphas, pre_peak_index = self.predictor(encoder_out, None, encoder_out_mask, ignore_id=self.ignore_id)
+        return pre_acoustic_embeds, pre_token_length, alphas, pre_peak_index
+    
+    def cal_decoder_with_predictor(self, encoder_out, encoder_mask, sematic_embeds, semantic_mask):
+        
+        decoder_outs = self.decoder(
+            sematic_embeds, semantic_mask, encoder_out, encoder_mask
+        )
+        decoder_out = decoder_outs[0]
+        decoder_out = torch.log_softmax(decoder_out, dim=-1)
+        return decoder_out, semantic_mask.sum(-1)
+
+    def recognize(
+            self,
+            speech: torch.Tensor,
+            speech_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Currently, only support greedy decoding
+        Args:
+            speech (torch.Tensor): (batch, max_len, feat_dim)
+            speech_length (torch.Tensor): (batch, )
+        """
+        assert speech.shape[0] == speech_lengths.shape[0]
+        device = speech.device
+        batch_size = speech.shape[0]
+        
+        # encoder
+        # encoder_out: (B, T, encoder_dim), encoder_mask: (B, 1, T)
+        encoder_out, encoder_mask = self.encoder(speech, speech_lengths)
+        encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+
+        # predictor
+        predictor_outs = self.calc_predictor(encoder_out, encoder_out_lens)
+
+        pre_acoustic_embeds, pre_token_length, alphas, pre_peak_index = predictor_outs[0], predictor_outs[1], predictor_outs[2], predictor_outs[3]
+        pre_token_length = pre_token_length.round().long()
+
+        if torch.max(pre_token_length) < 1:
+            return torch.ones((batch_size, 1), device=device, dtype=torch.long) * self.eos
+        
+        # (B, L)
+        tgt_mask = (~make_pad_mask(pre_token_length, max_len=pre_token_length.max())).to(device)
+        decoder_outs = self.cal_decoder_with_predictor(encoder_out, encoder_mask.squeeze(1), pre_acoustic_embeds, tgt_mask)
+        # (B, L, V)
+        decoder_out, ys_pad_lens = decoder_outs[0], decoder_outs[1]
+        scores, hypos = decoder_out.max(-1)
+        hypos = hypos.masked_fill(~tgt_mask, self.eos)
+        return hypos, scores
+
 def init_asr_model(configs):
     if configs['cmvn_file'] is not None:
         mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
@@ -1484,7 +1682,40 @@ def init_copyasr_model(configs):
     )
     return model
 
+def init_paraformer_model(configs):
+    if configs['cmvn_file'] is not None:
+        mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
+        global_cmvn = GlobalCMVN(
+            torch.tensor(mean).float(),
+            torch.tensor(istd).float())
+    else:
+        global_cmvn = None
 
+    input_dim = configs['input_dim']
+    vocab_size = configs['output_dim']
+
+    encoder_type = configs.get('encoder', 'conformer')
+    if encoder_type == 'conformer':
+        encoder = ConformerEncoder(input_dim,
+                                   global_cmvn=global_cmvn,
+                                   **configs['encoder_conf'])
+    else:
+        encoder = TransformerEncoder(input_dim,
+                                     global_cmvn=global_cmvn,
+                                     **configs['encoder_conf'])
+        
+    decoder = ParaformerDecoder(vocab_size, encoder.output_size(), **configs['decoder_conf'])
+
+    predictor = CifPredictor(configs["predictor_conf"]["idim"], configs["predictor_conf"]["l_order"], configs["predictor_conf"]["r_order"], threshold=configs["predictor_conf"]["threshold"], tail_threshold=configs["predictor_conf"]["tail_threshold"])
+
+    model = ParaformerASRModel(
+        vocab_size,
+        encoder,
+        decoder,
+        predictor,
+        **configs['model_conf'],
+    )
+    return model
 
 def init_encoder(configs):
     if configs['cmvn_file'] is not None:

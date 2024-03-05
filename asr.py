@@ -8,7 +8,7 @@ from model.bartsp import BartASRCorrection, BartSpeechNER
 from utils.data import Dataset, collate_fn, NERDataset, ner_collate_fn, BartSeq2SeqDataset, bartseq2seq_collate_fn, BartTxtSeq2SeqDataset, barttxtseq2seq_collate_fn, CLASDataset, clas_collate_fn, copyne_collate_fn, CopyASRDataset, copyasr_collate_fn
 from torch.utils.data import RandomSampler, SequentialSampler, BatchSampler, DataLoader
 from supar.utils.logging import init_logger, logger, progress_bar, get_logger
-from wenet.transformer.asr_model import init_ctc_model, init_asr_model, init_copyasr_model
+from wenet.transformer.asr_model import init_ctc_model, init_asr_model, init_copyasr_model, init_paraformer_model
 from model.ctc_bert import CTCBertModel, CTCBertNERModel
 from utils.process import read_symbol_table, read_context_table, build_context_tensor
 from wenet.utils.scheduler import WarmupLR
@@ -2401,6 +2401,200 @@ class BartASRCorrectionParser(object):
                     i += 1
             print(metric)
             return metric
+
+class ParaformerASRParser(object):
+    def __init__(self, args) -> None:
+        self.args = args
+
+        with open(args.config, 'r') as fin:
+            configs = yaml.load(fin, Loader=yaml.FullLoader)
+
+        if 'fbank_conf' in configs['dataset_conf']:
+            input_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
+        else:
+            input_dim = configs['dataset_conf']['mfcc_conf']['num_mel_bins']
+
+        symbol_vocab = read_symbol_table(args.char_dict)
+        vocab_size = len(symbol_vocab)
+
+        configs['input_dim'] = input_dim
+        configs['output_dim'] = vocab_size
+        configs['cmvn_file'] = args.cmvn
+        configs['is_json_cmvn'] = True
+        self.configs = configs
+
+        self.model = init_paraformer_model(configs)
+        if args.device != '-1':
+            self.model = self.model.to(torch.device("cuda"))
+        
+    def load_model(self):
+        self.model.load_state_dict(torch.load(os.path.join(self.args.path, 'best.model')))
+        use_cuda = self.args.device != '-1' and torch.cuda.is_available()
+        device = torch.device('cuda' if use_cuda else 'cpu')
+        self.model = self.model.to(device)
+        
+    def train(self):
+        train_set = Dataset(self.args.train, self.args.char_dict, frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, speed_perturb=True, spec_aug=True, max_frame_num=self.args.max_frame_num)
+        train_loader = DataLoader(train_set, 
+                                collate_fn=collate_fn,
+                                batch_sampler=BatchSampler(RandomSampler(train_set),
+                                batch_size=self.args.batch_size,
+                                drop_last=False),
+                                num_workers=self.args.num_workers
+                                )
+        dev_set = Dataset(self.args.dev, self.args.char_dict, frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num)
+        dev_loader = DataLoader(dev_set, 
+                                collate_fn=collate_fn,
+                                batch_sampler=BatchSampler(RandomSampler(dev_set),
+                                batch_size=self.args.batch_size,
+                                drop_last=False),
+                                num_workers=self.args.num_workers
+                                )
+        logger.info(f"\n train: {len(train_set):6}\n dev:{len(dev_set):6}\n")
+
+        num_epochs = self.configs.get('max_epoch', 100)
+        optimizer = optim.Adam(self.model.parameters(), **self.configs['optim_conf'])
+        scheduler = WarmupLR(optimizer, **self.configs['scheduler_conf'])
+
+        clip = self.configs.get('grad_clip', 5.0)
+        log_interval = self.configs.get('log_interval', 10)
+        accum_grad = self.configs.get('accum_grad', 2)
+        logger.info('using accumulate grad, new batch size is {} times'
+                     ' larger than before'.format(accum_grad))
+        
+        best_dev_loss = 100000.0
+        best_epoch = -1
+        best_model_path = os.path.join(self.args.path, 'best.model')
+        current_model_path = os.path.join(self.args.path, 'current.model')
+        elapsed = timedelta()
+        for epoch in range(1, num_epochs+1):
+            self.model.train()
+            lr = optimizer.param_groups[0]['lr']
+            logger.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
+            bar = progress_bar(train_loader)
+            sum_loss = 0
+            start = datetime.now()
+            for i, dic in enumerate(bar, 1):
+                audio_feat = dic['audio_feat']
+                asr_target = dic['asr_target']
+                feats_lengths = dic['audio_feat_length']
+                target_lengths = dic['asr_target_length']
+                keys = dic['keys']
+                if self.args.device != '-1':
+                    audio_feat = audio_feat.to(torch.device("cuda"))
+                    asr_target = asr_target.to(torch.device("cuda"))
+                    feats_lengths = feats_lengths.to(torch.device("cuda"))
+                    target_lengths = target_lengths.to(torch.device("cuda"))
+                
+                loss, loss_att, loss_pre = self.model(
+                            audio_feat, feats_lengths, asr_target, target_lengths)
+                sum_loss += loss.item()
+                loss = loss / accum_grad
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+                if i % accum_grad == 0:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                if i % log_interval == 0:
+                    lr = optimizer.param_groups[0]['lr']
+                    log_str = 'TRAIN Batch {}/{} loss {:.6f} '.format(
+                        epoch, i,
+                        loss.item() * accum_grad)
+                    if loss_att is not None:
+                        log_str += 'loss_att {:.6f} '.format(loss_att.item())
+                    if loss_pre is not None:
+                        log_str += 'loss_pre {:.6f} '.format(loss_pre.item())
+                    log_str += 'lr {:.8f}'.format(lr)
+                    logger.info(log_str)
+            logger.info(f'average train loss: {(sum_loss/i):.6f}\n')
+
+            # evaluate on dev dataset
+            this_dev_loss = self.loss_on_dev(dev_loader)
+            t = datetime.now() - start
+            if this_dev_loss < best_dev_loss:
+                best_dev_loss = this_dev_loss
+                best_epoch = epoch
+                logger.info(f"{t}s elapsed (saved)\n")
+                torch.save(copy.deepcopy(self.model.state_dict()), best_model_path)
+            else:
+                logger.info(f"{t}s elapsed\n")
+            torch.save(copy.deepcopy(self.model.state_dict()), current_model_path)
+            torch.cuda.empty_cache()
+
+        logger.info(f"Epoch {best_epoch} saved")
+        logger.info(f"Best Average Dev loss: {best_dev_loss:.6f}")
+        logger.info(f"{elapsed}s elapsed, {elapsed / epoch}s/epoch")
+
+    @torch.no_grad()
+    def loss_on_dev(self, dataloader):
+        self.model.eval()
+        init_logger(logger)
+        sum_dev_loss = 0
+        bar = progress_bar(dataloader)
+        for i, dic in enumerate(bar, 1):
+            audio_feat = dic['audio_feat']
+            asr_target = dic['asr_target']
+            feats_lengths = dic['audio_feat_length']
+            target_lengths = dic['asr_target_length']
+            if self.args.device != '-1':
+                audio_feat = audio_feat.to(torch.device("cuda"))
+                asr_target = asr_target.to(torch.device("cuda"))
+                feats_lengths = feats_lengths.to(torch.device("cuda"))
+                target_lengths = target_lengths.to(torch.device("cuda"))
+            loss, loss_att, loss_pre = self.model(
+                            audio_feat, feats_lengths, asr_target, target_lengths)
+            sum_dev_loss += loss.item()
+        
+        logger.info(f'average dev loss: {(sum_dev_loss/i):.6f}')
+        return sum_dev_loss/i
+    
+    @torch.no_grad()
+    def eval(self):
+        self.model.eval()
+        init_logger(logger)
+        dataset = Dataset(self.args.input, self.args.char_dict, frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num)
+        dataloader = DataLoader(dataset,
+                                collate_fn=collate_fn,
+                                batch_sampler=BatchSampler(SequentialSampler(dataset),
+                                batch_size=self.args.batch_size,
+                                drop_last=False),
+                                num_workers=self.args.num_workers)
+        logger.info(f"\n dataset: {len(dataset):6}\n")
+        char_dict = {v:k for k, v in dataset.char_dict.items()}
+        eos = len(char_dict) - 1
+        special_brackets = ['(', ')', '<', '>', '[', ']']
+        bar = progress_bar(dataloader)
+        asr_res_file = self.args.res + '.asr'
+        with open(asr_res_file, 'w') as fasr:
+            for i, dic in enumerate(bar, 1):
+                audio_feat = dic['audio_feat']
+                asr_target = dic['asr_target']
+                feats_lengths = dic['audio_feat_length']
+                target_lengths = dic['asr_target_length']
+                keys = dic['keys']
+                if self.args.device != '-1':
+                    audio_feat = audio_feat.to(torch.device("cuda"))
+                    asr_target = asr_target.to(torch.device("cuda"))
+                    feats_lengths = feats_lengths.to(torch.device("cuda"))
+                    target_lengths = target_lengths.to(torch.device("cuda"))
+                
+                hyps, _ = self.model.recognize(audio_feat, feats_lengths)
+                hyps = [hyp.tolist() for hyp in hyps]
+
+                for i, key in enumerate(keys):
+                    content = []
+                    for w in hyps[i]:
+                        if w == eos:
+                            break
+                        content.append(char_dict[w])
+                        asr_res = ''.join(content)
+                        for bracket in special_brackets:
+                            asr_res = asr_res.replace(bracket, '')
+                        logger.info('{}    {}'.format(key, asr_res))
+                        fasr.write('{} {}\n'.format(key, asr_res))
+                        fasr.flush()
 
 
 if __name__ == "__main__":
