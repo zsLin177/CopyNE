@@ -21,6 +21,10 @@ from supar.utils.metric import ChartMetric, Metric, AishellNerMetric
 from utils.newoptim import PolynomialLR
 from collections import Counter
 
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
+
 class Parser(object):
     def __init__(self, args) -> None:
         self.args = args
@@ -2589,12 +2593,305 @@ class ParaformerASRParser(object):
                         if w == eos:
                             break
                         content.append(char_dict[w])
-                        asr_res = ''.join(content)
-                        for bracket in special_brackets:
-                            asr_res = asr_res.replace(bracket, '')
-                        logger.info('{}    {}'.format(key, asr_res))
-                        fasr.write('{} {}\n'.format(key, asr_res))
-                        fasr.flush()
+                    asr_res = ''.join(content)
+                    for bracket in special_brackets:
+                        asr_res = asr_res.replace(bracket, '')
+                    logger.info('{}    {}'.format(key, asr_res))
+                    fasr.write('{} {}\n'.format(key, asr_res))
+                    fasr.flush()
+
+class nParaformerASRParser(object):
+    def __init__(self, args) -> None:
+        self.args = args
+
+        with open(args.config, 'r') as fin:
+            configs = yaml.load(fin, Loader=yaml.FullLoader)
+
+        if 'fbank_conf' in configs['dataset_conf']:
+            input_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
+        else:
+            input_dim = configs['dataset_conf']['mfcc_conf']['num_mel_bins']
+
+        symbol_vocab = read_symbol_table(args.char_dict)
+        vocab_size = len(symbol_vocab)
+
+        configs['input_dim'] = input_dim
+        configs['output_dim'] = vocab_size
+        configs['cmvn_file'] = args.cmvn
+        configs['is_json_cmvn'] = True
+        self.epochs = configs["max_epoch"]
+        self.grad_clip = configs["grad_clip"]
+        self.accum_grad = configs["accum_grad"]
+        self.log_interval = configs["log_interval"]
+        self.keep_nbest_models = configs["keep_nbest_models"]
+        self.lr = configs["optim_conf"]["lr"]
+        self.warm_steps = configs["scheduler_conf"]["warmup_steps"]
+        self.configs = configs
+
+        self.model = init_paraformer_model(configs)
+        self.gpu_id = int(os.environ["LOCAL_RANK"])
+        self.model = self.model.to(self.gpu_id)
+
+        if self.args.mode == "train":
+            init_logger(logger)
+            train_set = Dataset(self.args.train, self.args.char_dict, frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, speed_perturb=True, spec_aug=True, max_frame_num=self.args.max_frame_num)
+            self.train_loader = DataLoader(train_set, batch_size=self.args.batch_size, sampler=DistributedSampler(train_set), collate_fn=collate_fn, num_workers=self.args.num_workers)
+            logger.info(f"\n Rank:{self.gpu_id} train: {len(train_set):6}\n")
+
+            steps = (len(train_set)//self.args.batch_size) * self.epochs // self.accum_grad
+            self.optimizer = AdamW(
+                    [{'params': c, 'lr': self.lr} for n, c in self.model.named_parameters()], self.lr)
+            self.scheduler = get_linear_schedule_with_warmup(self.optimizer, self.warm_steps, steps)
+
+            self.start_epoch = 1
+            if self.gpu_id == 0:
+                self.best_epoch, self.best_dev_loss = 1, 100000
+                self.best_model_path, self.curr_model_path = os.path.join(self.args.path, 'best.model'), os.path.join(self.args.path, 'current.model')
+                if self.keep_nbest_models > 1:
+                    # the best loss is not saved here
+                    self.nbest_loss_lst = [self.best_dev_loss] * (self.keep_nbest_models - 1)
+                    self.nbest_epoch_lst = [self.best_epoch] * (self.keep_nbest_models - 1)
+                else:
+                    self.nbest_loss_lst = None
+                    self.nbest_epoch_lst = None
+
+            # continue training
+            if self.args.pre_model != "None":
+                loc = f"cuda:{self.gpu_id}"
+                checkpoint = torch.load(self.args.pre_model, map_location=loc)
+                self.start_epoch = checkpoint['epoch'] + 1
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'best_dev_loss' in checkpoint and self.gpu_id == 0:
+                    self.best_dev_loss = checkpoint['best_dev_loss']
+                if 'best_epoch' in checkpoint and self.gpu_id == 0:
+                    self.best_epoch = checkpoint['best_epoch']
+                else:
+                    self.best_epoch = self.start_epoch
+                
+                if "nbest_loss_lst" in checkpoint and self.gpu_id == 0:
+                    self.nbest_loss_lst = checkpoint["nbest_loss_lst"]
+
+                if "nbest_epoch_lst" in checkpoint and self.gpu_id == 0:
+                    self.nbest_epoch_lst = checkpoint["nbest_epoch_lst"]
+
+                if self.gpu_id == 0:
+                    logger.info(f"Rank:{self.gpu_id} loading previous model from {self.args.pre_model}, start epoch {self.start_epoch}, best epoch {self.best_epoch}, best dev loss {self.best_dev_loss}")
+                else:
+                    logger.info(f"Rank:{self.gpu_id} loading previous model from {self.args.pre_model}, start epoch {self.start_epoch}")
+                del checkpoint
+                torch.cuda.empty_cache()
+
+        elif self.args.mode == "evaluate":
+            if self.args.use_avg:
+                path = os.path.join(self.args.path, 'avg.model')
+            else:
+                path = os.path.join(self.args.path, 'best.model')
+            self.load_model(path)
+            
+        self.model = DDP(self.model, device_ids=[self.gpu_id], find_unused_parameters=True)
+                
+    def load_model(self, model_path):
+        assert model_path != 'None'
+        loc = f"cuda:{self.gpu_id}"
+        logger.info(f"Rank:{self.gpu_id} loading model from {model_path}")
+        checkpoint = torch.load(model_path, map_location=loc)
+        if "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            self.model.load_state_dict(checkpoint)
+        
+    def train(self):
+        if self.gpu_id == 0:
+            dev_set = Dataset(self.args.dev, self.args.char_dict, frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num)
+            dev_loader = DataLoader(dev_set, 
+                                    collate_fn=collate_fn,
+                                    batch_sampler=BatchSampler(RandomSampler(dev_set),
+                                    batch_size=self.args.batch_size,
+                                    drop_last=False),
+                                    num_workers=self.args.num_workers
+                                    )
+            logger.info(f"\n dev:{len(dev_set):6}\n")
+
+        
+        elapsed = timedelta()
+        for epoch in range(self.start_epoch, self.epochs + 1):
+            self.model.train()
+            self.train_loader.sampler.set_epoch(epoch)
+            start = datetime.now()
+            logger.info(f"Rank:{self.gpu_id} Epoch {epoch} / {self.epochs}:")
+            sum_loss = 0
+            bar = progress_bar(self.train_loader)
+            for i, dic in enumerate(bar, 1):
+                audio_feat = dic['audio_feat']
+                asr_target = dic['asr_target']
+                feats_lengths = dic['audio_feat_length']
+                target_lengths = dic['asr_target_length']
+                keys = dic['keys']
+                audio_feat = audio_feat.to(self.gpu_id)
+                asr_target = asr_target.to(self.gpu_id)
+                feats_lengths = feats_lengths.to(self.gpu_id)
+                target_lengths = target_lengths.to(self.gpu_id)
+                
+                loss, loss_att, loss_pre, loss_ctc, pre_loss_att = self.model(
+                            audio_feat, feats_lengths, asr_target, target_lengths)
+                sum_loss += loss.item()
+                loss = loss / self.accum_grad
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                if i % self.accum_grad == 0:
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+
+                if i % self.log_interval == 0:
+                    lr = self.optimizer.param_groups[0]['lr']
+                    log_str = 'TRAIN Batch {}/{} loss {:.6f} '.format(
+                        epoch, i,
+                        loss.item() * self.accum_grad)
+                    if loss_att is not None:
+                        log_str += 'loss_att {:.6f} '.format(loss_att.item())
+                    if pre_loss_att is not None:
+                        log_str += 'pre_loss_att {:.6f} '.format(pre_loss_att.item())
+                    if loss_ctc is not None:
+                        log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
+                    if loss_pre is not None:
+                        log_str += 'loss_pre {:.6f} '.format(loss_pre.item())
+                    log_str += 'lr {:.8f}'.format(lr)
+                    logger.info(f"Rank:{self.gpu_id} {log_str}")
+            logger.info(f'Rank:{self.gpu_id} average train loss: {(sum_loss/i):.6f}\n')
+
+            if self.gpu_id == 0:
+                # evaluate on dev dataset
+                this_dev_loss = self.loss_on_dev(dev_loader)
+                t = datetime.now() - start
+                if this_dev_loss < self.best_dev_loss:
+                    self.best_dev_loss = this_dev_loss
+                    self.best_epoch = epoch
+                    logger.info(f"Rank:{self.gpu_id} {t}s elapsed (saved)\n")
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': self.model.module.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'scheduler_state_dict': self.scheduler.state_dict(),
+                        'best_dev_loss': self.best_dev_loss,
+                        'best_epoch': self.best_epoch,
+                        'nbest_loss_lst': self.nbest_loss_lst,
+                        'nbest_epoch_lst': self.nbest_epoch_lst,
+                        }, self.best_model_path)
+                else:
+                    if self.nbest_loss_lst is not None and this_dev_loss < self.nbest_loss_lst[-1]:
+                        # find the place to insert
+                        idx = 0
+                        for idx in range(self.keep_nbest_models - 1):
+                            if this_dev_loss < self.nbest_loss_lst[idx]:
+                                break
+                        self.nbest_loss_lst.insert(idx, this_dev_loss)
+                        self.nbest_epoch_lst.insert(idx, epoch)
+                        to_del_loss = self.nbest_loss_lst.pop()
+                        to_del_epoch = self.nbest_epoch_lst.pop()
+                        save_model_path = os.path.join(self.args.path, f'nbest_epo_{epoch}.model')
+                        del_model_path = os.path.join(self.args.path, f'nbest_epo_{to_del_epoch}.model')
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': self.model.module.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'scheduler_state_dict': self.scheduler.state_dict(),
+                            'best_dev_loss': this_dev_loss,
+                            'best_epoch': epoch,
+                            'nbest_loss_lst': self.nbest_loss_lst,
+                            'nbest_epoch_lst': self.nbest_epoch_lst,
+                            }, save_model_path)
+                        if os.path.exists(del_model_path):
+                            os.remove(del_model_path)
+                        logger.info(f"Rank:{self.gpu_id}: Epoch:{epoch} rankindex {idx} saved, Epoch:{to_del_epoch} deleted.\n")
+                    logger.info(f"Rank:{self.gpu_id} {t}s elapsed\n")
+
+                torch.save({
+                    'epoch': epoch,
+                        'model_state_dict': self.model.module.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'scheduler_state_dict': self.scheduler.state_dict(),
+                        'best_dev_loss': self.best_dev_loss,
+                        'best_epoch': self.best_epoch,
+                        'nbest_loss_lst': self.nbest_loss_lst,
+                        'nbest_epoch_lst': self.nbest_epoch_lst,
+                        }, self.curr_model_path)
+                torch.cuda.empty_cache()
+
+        if self.gpu_id == 0:
+            logger.info(f"Epoch {self.best_epoch} saved")
+            logger.info(f"Best Average Dev loss: {self.best_dev_loss:.6f}")
+
+    @torch.no_grad()
+    def loss_on_dev(self, dataloader):
+        self.model.eval()
+        init_logger(logger)
+        sum_dev_loss = 0
+        bar = progress_bar(dataloader)
+        for i, dic in enumerate(bar, 1):
+            audio_feat = dic['audio_feat']
+            asr_target = dic['asr_target']
+            feats_lengths = dic['audio_feat_length']
+            target_lengths = dic['asr_target_length']
+            
+            audio_feat = audio_feat.to(self.gpu_id)
+            asr_target = asr_target.to(self.gpu_id)
+            feats_lengths = feats_lengths.to(self.gpu_id)
+            target_lengths = target_lengths.to(self.gpu_id)
+            loss, loss_att, loss_pre, loss_ctc, pre_loss_att = self.model(
+                            audio_feat, feats_lengths, asr_target, target_lengths)
+            sum_dev_loss += loss.item()
+        
+        logger.info(f'Rank:{self.gpu_id} average dev loss: {(sum_dev_loss/i):.6f}')
+        return sum_dev_loss/i
+    
+    @torch.no_grad()
+    def eval(self):
+        self.model.eval()
+        init_logger(logger)
+        dataset = Dataset(self.args.input, self.args.char_dict, frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num)
+        dataloader = DataLoader(dataset,
+                                collate_fn=collate_fn,
+                                batch_sampler=BatchSampler(SequentialSampler(dataset),
+                                batch_size=self.args.batch_size,
+                                drop_last=False),
+                                num_workers=self.args.num_workers)
+        logger.info(f"\n dataset: {len(dataset):6}\n")
+        char_dict = {v:k for k, v in dataset.char_dict.items()}
+        eos = len(char_dict) - 1
+        special_brackets = ['(', ')', '<', '>', '[', ']']
+        bar = progress_bar(dataloader)
+        asr_res_file = self.args.res + '.asr'
+        with open(asr_res_file, 'w') as fasr:
+            for i, dic in enumerate(bar, 1):
+                audio_feat = dic['audio_feat']
+                # asr_target = dic['asr_target']
+                feats_lengths = dic['audio_feat_length']
+                # target_lengths = dic['asr_target_length']
+                keys = dic['keys']
+                
+                audio_feat = audio_feat.to(self.gpu_id)
+                # asr_target = asr_target.to(self.gpu_id)
+                feats_lengths = feats_lengths.to(self.gpu_id)
+                # target_lengths = target_lengths.to(self.gpu_id)
+                
+                hyps, _ = self.model.module.recognize(audio_feat, feats_lengths)
+                hyps = [hyp.tolist() for hyp in hyps]
+
+                for i, key in enumerate(keys):
+                    content = []
+                    for w in hyps[i]:
+                        if w == eos:
+                            break
+                        content.append(char_dict[w])
+                    asr_res = ''.join(content)
+                    for bracket in special_brackets:
+                        asr_res = asr_res.replace(bracket, '')
+                    logger.info('{}    {}'.format(key, asr_res))
+                    fasr.write('{} {}\n'.format(key, asr_res))
+                    fasr.flush()
 
 
 if __name__ == "__main__":

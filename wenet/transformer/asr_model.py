@@ -1404,12 +1404,16 @@ class ParaformerASRModel(torch.nn.Module):
                  encoder: TransformerEncoder,
                  decoder: ParaformerDecoder,
                  predictor: CifPredictor,
+                 ctc: CTC,
+                 ctc_weight: float = 0.3,
+                 blank_id=0,
                  predictor_weight: float = 1.0,
                  predictor_bias: int = 0,
                  sampling_ratio: float = 0.4,
                  ignore_id: int = IGNORE_ID,
                  lsm_weight: float = 0.0,
                  length_normalized_loss: bool = False,
+                 use_1st_decoder_loss: bool = False,
                 ):
         super().__init__()
         # note that eos is the same as sos (equivalent ID)
@@ -1420,10 +1424,14 @@ class ParaformerASRModel(torch.nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.predictor = predictor
+        self.ctc = ctc
         self.predictor_weight = predictor_weight
+        self.ctc_weight = ctc_weight
+        self.blank_id = blank_id
         self.predictor_bias = predictor_bias
         self.sampling_ratio = sampling_ratio
         self.length_normalized_loss = length_normalized_loss
+        self.use_1st_decoder_loss = use_1st_decoder_loss
 
         self.criterion_att = LabelSmoothingLoss(
             size=vocab_size,
@@ -1457,10 +1465,25 @@ class ParaformerASRModel(torch.nn.Module):
         encoder_out, encoder_mask = self.encoder(speech, speech_lengths)
         # encoder_out_lens: (B, )
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
-        # 2. Decoder
-        loss_att, loss_pre = self._calc_att_loss(encoder_out, encoder_mask, text, text_lengths)
-        loss = loss_att + self.predictor_weight * loss_pre
-        return loss, loss_att, loss_pre
+        # 2.a Decoder
+        loss_att, loss_pre, pre_loss_att = self._calc_att_loss(encoder_out, encoder_mask, text, text_lengths)
+
+        # 2.b CTC
+        if self.ctc_weight != 0.0:
+            loss_ctc = self.ctc(encoder_out, encoder_out_lens, text, text_lengths)
+        else:
+            loss_ctc = None
+
+        if self.ctc_weight == 0.0:
+            loss = loss_att + loss_pre * self.predictor_weight
+        elif self.ctc_weight == 1.0:
+            loss = loss_ctc
+        else:
+            loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att + loss_pre * self.predictor_weight
+
+        if self.use_1st_decoder_loss and pre_loss_att is not None:
+            loss = loss + (1 - self.ctc_weight) * pre_loss_att
+        return loss, loss_att, loss_pre, loss_ctc, pre_loss_att
     
     def _calc_att_loss(
             self,
@@ -1482,13 +1505,16 @@ class ParaformerASRModel(torch.nn.Module):
             ys_pad_lens = ys_pad_lens + self.predictor_bias
         
         # pred: (B, L, dim)
-        pre_acoustic_embeds, pre_token_length, _, pre_peak_index = self.predictor(encoder_out, ys_pad, encoder_mask,               ignore_id=self.ignore_id)
+        pre_acoustic_embeds, pre_token_length, _, pre_peak_index = self.predictor(encoder_out, ys_pad, encoder_mask, ignore_id=self.ignore_id)
 
         # 0. sampler
         decoder_out_1st = None
         pre_loss_att = None
         if self.sampling_ratio > 0.0:
-            sematic_embeds, decoder_out_1st = self.sampler(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds)
+            if not self.use_1st_decoder_loss:
+                sematic_embeds, decoder_out_1st = self.sampler(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds)
+            else:
+                sematic_embeds, decoder_out_1st, pre_loss_att = self.sampler_with_grad(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds)
         else:
             sematic_embeds = pre_acoustic_embeds
 
@@ -1503,7 +1529,37 @@ class ParaformerASRModel(torch.nn.Module):
         loss_att = self.criterion_att(decoder_out, ys_pad)
         loss_pre = self.criterion_pre(ys_pad_lens.type_as(pre_token_length), pre_token_length)
 
-        return loss_att, loss_pre
+        return loss_att, loss_pre, pre_loss_att
+    
+    def sampler_with_grad(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds):
+        tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())[:, :, None]).to(ys_pad.device)
+        ys_pad_masked = ys_pad * tgt_mask[:, :, 0]
+
+        ys_pad_embed, _ = self.decoder.embed(ys_pad_masked)
+        decoder_outs = self.decoder(
+                pre_acoustic_embeds, tgt_mask.squeeze(-1), encoder_out, encoder_mask.squeeze(1))
+        pre_loss_att = self.criterion_att(decoder_outs[0], ys_pad)
+
+        decoder_out, _ = decoder_outs[0], decoder_outs[1]
+        pred_tokens = decoder_out.argmax(-1)
+        nonpad_positions = ys_pad.ne(self.ignore_id)
+        seq_lens = (nonpad_positions).sum(1)
+        same_num = ((pred_tokens == ys_pad) & nonpad_positions).sum(1)
+        input_mask = torch.ones_like(nonpad_positions)
+        bsz, seq_len = ys_pad.size()
+        for li in range(bsz):
+            target_num = (((seq_lens[li] - same_num[li].sum()).float()) * self.sampling_ratio).long()
+            if target_num > 0:
+                input_mask[li].scatter_(dim=0,
+                                        index=torch.randperm(seq_lens[li])[:target_num].to(input_mask.device),
+                                        value=0)
+        input_mask = input_mask.eq(1)
+        input_mask = input_mask.masked_fill(~nonpad_positions, False)
+        input_mask_expand_dim = input_mask.unsqueeze(2).to(pre_acoustic_embeds.device)
+        sematic_embeds = pre_acoustic_embeds.masked_fill(~input_mask_expand_dim, 0) + ys_pad_embed.masked_fill(
+            input_mask_expand_dim, 0)
+        return sematic_embeds * tgt_mask, decoder_out * tgt_mask, pre_loss_att
+
 
     def sampler(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds):
         tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())[:, :, None]).to(ys_pad.device)
@@ -1708,11 +1764,14 @@ def init_paraformer_model(configs):
 
     predictor = CifPredictor(configs["predictor_conf"]["idim"], configs["predictor_conf"]["l_order"], configs["predictor_conf"]["r_order"], threshold=configs["predictor_conf"]["threshold"], tail_threshold=configs["predictor_conf"]["tail_threshold"])
 
+    ctc = CTC(vocab_size, encoder.output_size(), blank_id=configs['model_conf']['blank_id'])
+
     model = ParaformerASRModel(
         vocab_size,
         encoder,
         decoder,
         predictor,
+        ctc,
         **configs['model_conf'],
     )
     return model

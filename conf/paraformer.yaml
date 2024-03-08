@@ -5,7 +5,10 @@ model_conf:
     lsm_weight: 0.1
     length_normalized_loss: false
     predictor_weight: 1.0
+    ctc_weight: 0.3
+    blank_id: 0
     sampling_ratio: 0.4
+    use_1st_decoder_loss: true
 
 # encoder
 encoder: conformer
@@ -77,7 +80,7 @@ dataset_conf:
 
 grad_clip: 5
 accum_grad: 1
-max_epoch: 150
+max_epoch: 120
 log_interval: 100
 keep_nbest_models: 10
 

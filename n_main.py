@@ -1,17 +1,19 @@
 import argparse
 
-from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParser, ParaformerASRParser
+from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParser, nParaformerASRParser
 from supar.utils.logging import init_logger, logger
 import os
 import torch
-import random
+from torch.distributed import init_process_group, destroy_process_group
+
+def ddp_setup():
+    init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 def parse(parser):
-    parser.add_argument('--type', choices=["paraformer", "other"])
+    ddp_setup()
     parser.add_argument('--path', help='path to model file')
-    parser.add_argument('--device',
-                        default='-1',
-                        help='ID of GPU to use')
+    parser.add_argument('--pre_model', type=str, default="None")
     parser.add_argument('--seed',
                         '-s',
                         default=1,
@@ -24,9 +26,6 @@ def parse(parser):
     parser.add_argument('--num_workers',
                         default=6,
                         type=int)
-    parser.add_argument('--e2ener', 
-                        action='store_true',
-                        help='whether it is an e2ener model')
     parser.add_argument('--char_dict', 
                         default='data/sp_ner/chinese_char.txt', 
                         help='path to the char dict file')
@@ -36,12 +35,6 @@ def parse(parser):
     parser.add_argument('--config', 
                         default='conf/ctc_mel80.yaml', 
                         help='config file')
-    parser.add_argument('--add_bert',
-                        action='store_true', 
-                        help='whether to add bert')
-    parser.add_argument('--bert', 
-                        default='bert-base-chinese', 
-                        help='which bert model to use')
     parser.add_argument('--frame_length',
                         default=25,
                         type=int)
@@ -51,56 +44,40 @@ def parse(parser):
     parser.add_argument('--max_frame_num',
                         default=10000,
                         type=int)
-    parser.add_argument('--add_context', 
-                        action='store_true',
-                        help='whether to add context')
-    parser.add_argument('--pad_context',
-                        default=3,
-                        type=float)
-    parser.add_argument('--train_ne_dict', default='data/end2end/aishell_train_ner_most-all.vocab')
-    parser.add_argument('--dev_ne_dict', default='data/end2end/aishell_dev_ner_random-500.vocab')
-    parser.add_argument('--att_type', default='contextual', type=str, choices=['contextual', 'crossatt', 'simpleatt'])
-    parser.add_argument('--add_copy_loss', action='store_true')
-    parser.add_argument('--no_concat', action='store_true')
-
-    
 
     args, unknown = parser.parse_known_args()
     args, _ = parser.parse_known_args(unknown, args)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
     torch.manual_seed(args.seed)
     if int((torch.__version__)[0]) > 1:
         torch.set_float32_matmul_precision('high') # it should be set to high for torch2.0
     init_logger(logger, os.path.join(args.path, f"{args.mode}.log"))
+    logger.info('\n' + str(args))
+
+    # try:
+    #     if args.mode == 'train':
+    #         parser = nParaformerASRParser(args)
+    #         logger.info(f'{parser.model}\n')
+    #         parser.train()
+    #     elif args.mode == 'evaluate':
+    #         parser = nParaformerASRParser(args)
+    #         logger.info(f'{parser.model}\n')
+    #         parser.eval()
+    # except Exception as e:
+    #     logger.error(e)
+    # finally:
+    #     destroy_process_group()
 
     if args.mode == 'train':
-        if not args.add_context:
-            if args.type == 'other':
-                parser = CTCAttentionASRParser(args)
-            elif args.type == 'paraformer':
-                parser = ParaformerASRParser(args)
-        else:
-            if not args.add_copy_loss:
-                parser = CLASCTCAttentionASRParser(args)
-            else:
-                parser = CopyNEASRParser(args)
+        parser = nParaformerASRParser(args)
         logger.info(f'{parser.model}\n')
         parser.train()
     elif args.mode == 'evaluate':
-        if not args.add_context:
-            if args.type == 'other':
-                parser = CTCAttentionASRParser(args)
-            elif args.type == 'paraformer':
-                parser = ParaformerASRParser(args)
-        else:
-            if not args.add_copy_loss:
-                parser = CLASCTCAttentionASRParser(args)
-            else:
-                parser = CopyNEASRParser(args)
+        parser = nParaformerASRParser(args)
         logger.info(f'{parser.model}\n')
-        parser.load_model()
         parser.eval()
+    
+    destroy_process_group()
 
 
 
@@ -115,11 +92,8 @@ if __name__ == '__main__':
 
     subparser = subparsers.add_parser('evaluate', help='Evaluation.')
     subparser.add_argument('--input', default='data/aishell1_asr/test.json', help='path to input file')
-    subparser.add_argument('--test_ne_dict', default='data/end2end/aishell_dev_ner_allmost300.vocab')
     subparser.add_argument('--res', default='pred.txt', help='path to input file')
-    subparser.add_argument('--decode_mode', choices=['attention', 'ctc_greedy_search', 'copy_attention'], help='decoding mode to use')
-    subparser.add_argument('--beam_size', default=10, type=int, help='beam size')
-    subparser.add_argument('--copy_threshold', default=0.9, type=float, help='threshold for copying')
+    subparser.add_argument('--use_avg', default=False, action='store_true', help='use average model')
 
     parse(parser)
     
