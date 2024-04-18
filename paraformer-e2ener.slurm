@@ -11,11 +11,11 @@
 source /public/home/gongchen18/anaconda3/bin/activate
 conda activate whisper
 
-torchrun --nnodes=1 --nproc_per_node=4 --master_port=29501 n_main.py train --train data/end2end/train.json \
+torchrun --nnodes=1 --nproc_per_node=4 n_main.py train --train data/end2end/train.json \
                      --dev data/end2end/dev.json \
                      --test data/end2end/test.json \
-                     --path exp/paraformer-mysampler \
-                     --mysampler \
+                     --path exp/paraformer-ctc-e2ener \
+                     --e2e_ner \
                      --batch_size 32 \
                      --seed 777 \
                      --config conf/paraformer.yaml \

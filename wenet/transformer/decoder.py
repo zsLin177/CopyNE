@@ -14,6 +14,10 @@ from wenet.transformer.embedding import PositionalEncoding
 from wenet.transformer.positionwise_feed_forward import PositionwiseFeedForward
 from wenet.utils.mask import (subsequent_mask, make_pad_mask)
 from model.contextual_encoder import ContextualAttention, CrossAttention, SimpleAttention, DotAttention
+from wenet.transformer.lstm import LstmEncoder
+from wenet.transformer.bert import BertEmbedding
+import torch.nn as nn
+from supar.structs.chain import LinearChainCRF
 
 
 class TransformerDecoder(torch.nn.Module):
@@ -705,6 +709,11 @@ class ParaformerDecoder(torch.nn.Module):
         use_output_layer: bool = True,
         normalize_before: bool = True,
         concat_after: bool = False,
+        add_ne_feat: bool = False,
+        ne_label_num :int = 7,
+        add_bert_feat: bool = False,
+        bert_path: str = 'bert-base-uncased',
+        e2e_ner: bool = False,
     ):
         assert check_argument_types()
         super().__init__()
@@ -717,6 +726,17 @@ class ParaformerDecoder(torch.nn.Module):
             )
         else:
             raise ValueError(f"only 'embed' is supported: {input_layer}")
+        
+        if add_ne_feat:
+            self.ne_lstm = LstmEncoder(ne_label_num, n_lstm_hidden=attention_dim//2, char_pad_idx=-1)
+
+        if add_bert_feat:
+            self.bert_embed = BertEmbedding(bert_path, 3, attention_dim, requires_grad=False)
+
+        self.e2e_ner = e2e_ner
+        if e2e_ner:
+            self.ner_head = NERHead(attention_dim, ne_label_num)
+
         self.normalize_before = normalize_before
         self.after_norm = torch.nn.LayerNorm(attention_dim, eps=1e-5)
         self.use_output_layer = use_output_layer
@@ -768,9 +788,57 @@ class ParaformerDecoder(torch.nn.Module):
             x = self.after_norm(x)
         if self.use_output_layer:
             # [batch, T, vocab_size]
-            x = self.output_layer(x)
+            logits = self.output_layer(x)
         olens = x_mask.sum(1)
-        return x, olens
+        
+        ne_logits = None
+        if self.e2e_ner:
+            ne_logits = self.ner_head(x)
+        return logits, olens, ne_logits
+        
+class NERHead(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        n_labels: int,
+    ):
+        super().__init__()
+        self.output_layer = torch.nn.Linear(input_dim, n_labels)
+        self.trans = nn.Parameter(torch.zeros(n_labels+1, n_labels+1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, T, input_dim)
+        Returns:
+            (batch, T, n_labels)
+        """
+        return self.output_layer(x)
+    
+    def decode(self, score, mask):
+        """
+        Args:
+            score: (batch, T, n_labels)
+            mask: (batch, T)
+        Returns:
+            (batch, T), (batch, )
+        """
+        dist = LinearChainCRF(score, self.trans, lens=mask.sum(-1))
+        return dist.argmax, (dist.max - dist.log_partition).exp()
+    
+    def loss(self, score, gold_labels, mask):
+        """
+        Args:
+            score: (batch, T, n_labels)
+            gold_labels: (batch, T)
+            mask: (batch, T)
+        Returns:
+            (batch, )
+        """
+        batch_size, seq_len = mask.shape
+        # loss = -CRFLinearChain(score[:, 1:], mask[:, 1:], self.trans).log_prob(gold_labels).sum() / seq_len
+        loss = -LinearChainCRF(score, self.trans, lens=mask.sum(-1)).log_prob(gold_labels).sum() / seq_len
+        return loss
         
 
 def get_need_att_mask(left_id_lst, right_id_lst, ids):

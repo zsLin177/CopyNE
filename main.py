@@ -4,14 +4,16 @@ from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParse
 from supar.utils.logging import init_logger, logger
 import os
 import torch
-import random
+from torch.distributed import init_process_group, destroy_process_group
+
+def ddp_setup():
+    init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 def parse(parser):
-    parser.add_argument('--type', choices=["paraformer", "other"])
+    ddp_setup()
     parser.add_argument('--path', help='path to model file')
-    parser.add_argument('--device',
-                        default='-1',
-                        help='ID of GPU to use')
+    parser.add_argument('--pre_model', type=str, default="None")
     parser.add_argument('--seed',
                         '-s',
                         default=1,
@@ -22,7 +24,7 @@ def parse(parser):
                         type=int,
                         help='batch size')
     parser.add_argument('--num_workers',
-                        default=6,
+                        default=1,
                         type=int)
     parser.add_argument('--e2ener', 
                         action='store_true',
@@ -62,24 +64,22 @@ def parse(parser):
     parser.add_argument('--att_type', default='contextual', type=str, choices=['contextual', 'crossatt', 'simpleatt'])
     parser.add_argument('--add_copy_loss', action='store_true')
     parser.add_argument('--no_concat', action='store_true')
+    parser.add_argument('--use_avg', action='store_true')
 
     
 
     args, unknown = parser.parse_known_args()
     args, _ = parser.parse_known_args(unknown, args)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
     torch.manual_seed(args.seed)
     if int((torch.__version__)[0]) > 1:
         torch.set_float32_matmul_precision('high') # it should be set to high for torch2.0
     init_logger(logger, os.path.join(args.path, f"{args.mode}.log"))
+    logger.info('\n' + str(args))
 
     if args.mode == 'train':
         if not args.add_context:
-            if args.type == 'other':
-                parser = CTCAttentionASRParser(args)
-            elif args.type == 'paraformer':
-                parser = ParaformerASRParser(args)
+            parser = CTCAttentionASRParser(args)
         else:
             if not args.add_copy_loss:
                 parser = CLASCTCAttentionASRParser(args)
@@ -89,18 +89,15 @@ def parse(parser):
         parser.train()
     elif args.mode == 'evaluate':
         if not args.add_context:
-            if args.type == 'other':
-                parser = CTCAttentionASRParser(args)
-            elif args.type == 'paraformer':
-                parser = ParaformerASRParser(args)
+            parser = CTCAttentionASRParser(args)
         else:
             if not args.add_copy_loss:
                 parser = CLASCTCAttentionASRParser(args)
             else:
                 parser = CopyNEASRParser(args)
         logger.info(f'{parser.model}\n')
-        parser.load_model()
         parser.eval()
+    destroy_process_group()
 
 
 

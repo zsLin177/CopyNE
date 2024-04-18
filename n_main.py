@@ -44,6 +44,20 @@ def parse(parser):
     parser.add_argument('--max_frame_num',
                         default=10000,
                         type=int)
+    parser.add_argument('--mysampler',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--add_ne_feat',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--ne_dict_file', default='data_to_upload/aishell_vocab/nelabel.vocab', help='path to the ne label dict file')
+    parser.add_argument('--add_bert_feat',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--bert_path', default='bert-base-chinese', help='path to the bert model')
+    parser.add_argument('--e2e_ner',
+                        default=False,
+                        action='store_true')
 
     args, unknown = parser.parse_known_args()
     args, _ = parser.parse_known_args(unknown, args)
@@ -54,30 +68,19 @@ def parse(parser):
     init_logger(logger, os.path.join(args.path, f"{args.mode}.log"))
     logger.info('\n' + str(args))
 
-    # try:
-    #     if args.mode == 'train':
-    #         parser = nParaformerASRParser(args)
-    #         logger.info(f'{parser.model}\n')
-    #         parser.train()
-    #     elif args.mode == 'evaluate':
-    #         parser = nParaformerASRParser(args)
-    #         logger.info(f'{parser.model}\n')
-    #         parser.eval()
-    # except Exception as e:
-    #     logger.error(e)
-    # finally:
-    #     destroy_process_group()
-
-    if args.mode == 'train':
-        parser = nParaformerASRParser(args)
-        logger.info(f'{parser.model}\n')
-        parser.train()
-    elif args.mode == 'evaluate':
-        parser = nParaformerASRParser(args)
-        logger.info(f'{parser.model}\n')
-        parser.eval()
-    
-    destroy_process_group()
+    try:
+        if args.mode == 'train':
+            parser = nParaformerASRParser(args)
+            logger.info(f'{parser.model}\n')
+            parser.train()
+        elif args.mode == 'evaluate':
+            parser = nParaformerASRParser(args)
+            logger.info(f'{parser.model}\n')
+            parser.eval()
+    except Exception as e:
+        logger.error(e)
+    finally:
+        destroy_process_group()
 
 
 

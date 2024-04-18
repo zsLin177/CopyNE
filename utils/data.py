@@ -12,14 +12,13 @@ loc_regex = '\(.+?\)'
 org_regex = '\<.+?\>'
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, json_file, char_dict_file, num_mel_bins=80, frame_length=25, frame_shift=10, max_frame_num=100000, speed_perturb=False, spec_aug=False, bert_tokenizer=None, e2ener=False, use_same_tokenizer=False, add_context=False) -> None:
+    def __init__(self, json_file, char_dict_file, num_mel_bins=80, frame_length=25, frame_shift=10, max_frame_num=100000, speed_perturb=False, spec_aug=False, bert_tokenizer=None, e2ener=False, use_same_tokenizer=False, add_context=False, add_ne_feat=False, nelabel_dict_file=None, add_bert_feat=False) -> None:
         super().__init__()
         self.num_mel_bins = num_mel_bins
         self.frame_length = frame_length
         self.frame_shift = frame_shift
         self.max_frame_num = max_frame_num
         self.data = read_json(json_file)
-        # <black> = 0, <unk> = 1, <sos/eos> = 4232
         self.char_dict = read_symbol_table(char_dict_file)
         self.speed_perturb = speed_perturb
         self.spec_aug = spec_aug
@@ -27,14 +26,16 @@ class Dataset(torch.utils.data.Dataset):
         self.e2ener = e2ener
         self.use_same_tokenizer = use_same_tokenizer
         self.add_context = add_context
+        self.add_ne_feat = add_ne_feat
+        self.add_bert_feat = add_bert_feat
+
+        if self.add_ne_feat:
+            assert nelabel_dict_file is not None
+            self.nelabel_dict = read_symbol_table(nelabel_dict_file)
+            self.O_idx = self.nelabel_dict['O']
+
         if self.bert_tokenizer is not None:
-            self.word_field = SubwordField('bert',
-                                    pad=self.bert_tokenizer.pad_token,
-                                    unk=self.bert_tokenizer.unk_token,
-                                    bos=self.bert_tokenizer.cls_token,
-                                    eos=self.bert_tokenizer.sep_token,
-                                    fix_len=10,
-                                    tokenize=self.bert_tokenizer.tokenize)
+            self.word_field = SubwordField('bert', pad=self.bert_tokenizer.pad_token, unk=self.bert_tokenizer.unk_token, bos=self.bert_tokenizer.cls_token, eos=self.bert_tokenizer.sep_token, fix_len=10, tokenize=self.bert_tokenizer.tokenize)
             self.word_field.vocab = self.bert_tokenizer.get_vocab()
 
     
@@ -100,8 +101,8 @@ class Dataset(torch.utils.data.Dataset):
         
         key = self.data[index]["key"]
 
-        if self.bert_tokenizer is not None:
-            bert_input = self.word_field.transform([tokens])[0]
+        if self.bert_tokenizer is not None and self.add_bert_feat:
+            bert_input = self.word_field.transform([tokens])[0][1:-1]
         else:
             bert_input = None
 
@@ -110,7 +111,14 @@ class Dataset(torch.utils.data.Dataset):
         else:
             need_att_mask = None
 
-        return y, label, key, bert_input, need_att_mask
+        if self.add_ne_feat:
+            bio_lst = self.data[index]["bio_lst"]
+            bio_lst = [self.nelabel_dict[item] for item in bio_lst]
+            bio_tensor = torch.tensor(bio_lst, dtype=torch.long)
+        else:
+            bio_tensor = None
+
+        return y, label, key, bert_input, need_att_mask, bio_tensor
 
     def build_need_att_mask(self, sentence, add_bos=True):
         if add_bos:
@@ -165,20 +173,22 @@ def collate_fn(batch):
     if curr_bert is not None:
         bert_pad_idx = 0
         bert_input = pad([instance[3] for instance in batch], padding_value=bert_pad_idx)
-        return {'audio_feat': audio_feat,
-                'asr_target': asr_target,
-                'audio_feat_length': audio_feat_length,
-                'asr_target_length': asr_target_length,
-                'keys': keys,
-                'bert_input': bert_input,
-                'need_att_mask': need_att_mask}
+    else:
+        bert_input = None
     
+    if batch[0][5] is not None:
+        bio_tensor = pad([instance[5] for instance in batch], padding_value=-1)
+    else:
+        bio_tensor = None
+
     return {'audio_feat': audio_feat,
-                'asr_target': asr_target,
-                'audio_feat_length': audio_feat_length,
-                'asr_target_length': asr_target_length,
-                'keys': keys,
-                'need_att_mask': need_att_mask}
+            'asr_target': asr_target,
+            'audio_feat_length': audio_feat_length,
+            'asr_target_length': asr_target_length,
+            'keys': keys,
+            'need_att_mask': need_att_mask,
+            'bio_ne': bio_tensor,
+            'bert_input': bert_input}
 
 
 class NERDataset(torch.utils.data.Dataset):

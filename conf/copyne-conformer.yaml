@@ -1,16 +1,5 @@
-
 # network architecture
-model: Paraformer
-model_conf:
-    lsm_weight: 0.1
-    length_normalized_loss: false
-    predictor_weight: 1.0
-    ctc_weight: 0.3
-    blank_id: 0
-    sampling_ratio: 0.4
-    use_1st_decoder_loss: true
-
-# encoder
+# encoder related
 encoder: conformer
 encoder_conf:
     output_size: 256    # dimension of attention
@@ -28,8 +17,8 @@ encoder_conf:
     pos_enc_layer_type: 'rel_pos'
     selfattention_layer_type: 'rel_selfattn'
 
-# decoder
-decoder: ParaformerDecoder
+# decoder related
+decoder: conattransformer
 decoder_conf:
     attention_heads: 4
     linear_units: 2048
@@ -38,15 +27,30 @@ decoder_conf:
     positional_dropout_rate: 0.1
     self_attention_dropout_rate: 0.0
     src_attention_dropout_rate: 0.0
+    contextual_att: true
+    cocoder_out_dim: 512
 
-# predictor
-predictor: CifPredictor
-predictor_conf:
-    idim: 256
-    threshold: 1.0
-    l_order: 1
-    r_order: 1
-    tail_threshold: 0.45
+# hybrid CTC/attention
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1     # label smoothing option
+    length_normalized_loss: false
+    add_context_att: true
+    add_null_context: true
+    concoder_cofig:
+        type: lstm
+        lstm:
+            input_size: 256
+            hidden_size: 512
+            num_layers: 3
+            dropout: 0.1
+            pad_idx: -1
+            bidirectional: false
+        transformer:
+            input_size: 256
+            num_layers: 2
+            dropout: 0.2
+            pad_idx: -1
 
 dataset_conf:
     filter_conf:
@@ -76,17 +80,17 @@ dataset_conf:
         sort_size: 500  # sort_size should be less than shuffle_size
     batch_conf:
         batch_type: 'static' # static or dynamic
-        batch_size: 16
+        batch_size: 32
 
 grad_clip: 5
 accum_grad: 1
-max_epoch: 150
+max_epoch: 240
 log_interval: 100
 keep_nbest_models: 10
 
 optim: adam
 optim_conf:
-    lr: 0.0005
+    lr: 0.002
 scheduler: warmuplr     # pytorch v1.1.0+ required
 scheduler_conf:
-    warmup_steps: 30000
+    warmup_steps: 25000

@@ -1414,6 +1414,11 @@ class ParaformerASRModel(torch.nn.Module):
                  lsm_weight: float = 0.0,
                  length_normalized_loss: bool = False,
                  use_1st_decoder_loss: bool = False,
+                 add_ne_feat: bool = False,
+                 O_idx: int = 0,
+                 add_bert_feat: bool = False,
+                 e2e_ner: bool = False,
+                 mysampler: bool = False,
                 ):
         super().__init__()
         # note that eos is the same as sos (equivalent ID)
@@ -1432,6 +1437,11 @@ class ParaformerASRModel(torch.nn.Module):
         self.sampling_ratio = sampling_ratio
         self.length_normalized_loss = length_normalized_loss
         self.use_1st_decoder_loss = use_1st_decoder_loss
+        self.add_ne_feat = add_ne_feat
+        self.O_idx = O_idx
+        self.add_bert_feat = add_bert_feat
+        self.e2e_ner = e2e_ner
+        self.mysampler = mysampler
 
         self.criterion_att = LabelSmoothingLoss(
             size=vocab_size,
@@ -1448,6 +1458,8 @@ class ParaformerASRModel(torch.nn.Module):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
+        ne_label: Optional[torch.Tensor] = None,
+        bert_input: Optional[torch.Tensor] = None,
     ):
         """Encoder + Decoder + Calc loss
         Args:
@@ -1466,7 +1478,9 @@ class ParaformerASRModel(torch.nn.Module):
         # encoder_out_lens: (B, )
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
         # 2.a Decoder
-        loss_att, loss_pre, pre_loss_att = self._calc_att_loss(encoder_out, encoder_mask, text, text_lengths)
+        if ne_label is not None:
+            ne_label = ne_label.masked_fill(ne_label.lt(0), self.O_idx)
+        loss_att, loss_pre, pre_loss_att, loss_ner, pre_loss_ner = self._calc_att_loss(encoder_out, encoder_mask, text, text_lengths, ne_label, bert_input)
 
         # 2.b CTC
         if self.ctc_weight != 0.0:
@@ -1483,7 +1497,12 @@ class ParaformerASRModel(torch.nn.Module):
 
         if self.use_1st_decoder_loss and pre_loss_att is not None:
             loss = loss + (1 - self.ctc_weight) * pre_loss_att
-        return loss, loss_att, loss_pre, loss_ctc, pre_loss_att
+
+        if self.e2e_ner:
+            loss = loss + loss_ner
+            if self.use_1st_decoder_loss and pre_loss_ner is not None:
+                loss = loss + pre_loss_ner
+        return loss, loss_att, loss_pre, loss_ctc, pre_loss_att, loss_ner, pre_loss_ner
     
     def _calc_att_loss(
             self,
@@ -1491,6 +1510,8 @@ class ParaformerASRModel(torch.nn.Module):
             encoder_mask: torch.Tensor,
             ys_pad: torch.Tensor,
             ys_pad_lens: torch.Tensor,
+            ne_label: Optional[torch.Tensor]= None,
+            bert_input: Optional[torch.Tensor]= None,
     ):
         """
         Args:
@@ -1498,11 +1519,13 @@ class ParaformerASRModel(torch.nn.Module):
             encoder_mask: (B, 1, T)
             ys_pad: (B, L)
             ys_pad_lens: (B, )
+            ne_label: (B, L)
         """
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
         if self.predictor_bias == 1:
             _, ys_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
             ys_pad_lens = ys_pad_lens + self.predictor_bias
+            _, ne_label = add_sos_eos(ne_label, self.O_idx, self.O_idx, self.ignore_id)
         
         # pred: (B, L, dim)
         pre_acoustic_embeds, pre_token_length, _, pre_peak_index = self.predictor(encoder_out, ys_pad, encoder_mask, ignore_id=self.ignore_id)
@@ -1510,37 +1533,53 @@ class ParaformerASRModel(torch.nn.Module):
         # 0. sampler
         decoder_out_1st = None
         pre_loss_att = None
+        crf_ner_loss = None
         if self.sampling_ratio > 0.0:
             if not self.use_1st_decoder_loss:
-                sematic_embeds, decoder_out_1st = self.sampler(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds)
+                sematic_embeds, decoder_out_1st = self.sampler(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds, ne_label, bert_input)
             else:
-                sematic_embeds, decoder_out_1st, pre_loss_att = self.sampler_with_grad(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds)
+                if not self.mysampler:
+                    sematic_embeds, decoder_out_1st, pre_loss_att, pre_crf_ner_loss = self.sampler_with_grad(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds, ne_label, bert_input)
+                else:
+                    sematic_embeds, decoder_out_1st, pre_loss_att, pre_crf_ner_loss = self.my_sampler_with_grad(encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds, ne_label, bert_input)
+
         else:
             sematic_embeds = pre_acoustic_embeds
 
         # 1. Forward decoder
         tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())).to(ys_pad.device)
         decoder_outs = self.decoder(sematic_embeds, tgt_mask, encoder_out, encoder_mask.squeeze(1))
-        decoder_out, _ = decoder_outs[0], decoder_outs[1]
+        decoder_out, _, ner_score = decoder_outs[0], decoder_outs[1], decoder_outs[2]
         if decoder_out_1st is None:
             decoder_out_1st = decoder_out
         
         # 2. Compute attention loss
         loss_att = self.criterion_att(decoder_out, ys_pad)
         loss_pre = self.criterion_pre(ys_pad_lens.type_as(pre_token_length), pre_token_length)
+        crf_ner_loss = None
+        if self.e2e_ner:
+            crf_ner_loss = self.decoder.ner_head.loss(ner_score, ne_label, tgt_mask)
 
-        return loss_att, loss_pre, pre_loss_att
+        return loss_att, loss_pre, pre_loss_att, crf_ner_loss, pre_crf_ner_loss
     
-    def sampler_with_grad(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds):
+    def sampler_with_grad(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds, ne_labels=None, bert_input=None):
         tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())[:, :, None]).to(ys_pad.device)
         ys_pad_masked = ys_pad * tgt_mask[:, :, 0]
 
         ys_pad_embed, _ = self.decoder.embed(ys_pad_masked)
+        if self.add_ne_feat and ne_labels is not None:
+            ys_pad_embed += self.decoder.ne_lstm(ne_labels)
+        if self.add_bert_feat and bert_input is not None:
+            ys_pad_embed += self.decoder.bert_embed(bert_input)
         decoder_outs = self.decoder(
                 pre_acoustic_embeds, tgt_mask.squeeze(-1), encoder_out, encoder_mask.squeeze(1))
+        crf_ner_loss = None
+        if self.e2e_ner:
+            crf_ner_loss = self.decoder.ner_head.loss(decoder_outs[2], ne_labels, tgt_mask.squeeze(-1))
+
         pre_loss_att = self.criterion_att(decoder_outs[0], ys_pad)
 
-        decoder_out, _ = decoder_outs[0], decoder_outs[1]
+        decoder_out, _, ne_score = decoder_outs[0], decoder_outs[1], decoder_outs[2]
         pred_tokens = decoder_out.argmax(-1)
         nonpad_positions = ys_pad.ne(self.ignore_id)
         seq_lens = (nonpad_positions).sum(1)
@@ -1558,19 +1597,23 @@ class ParaformerASRModel(torch.nn.Module):
         input_mask_expand_dim = input_mask.unsqueeze(2).to(pre_acoustic_embeds.device)
         sematic_embeds = pre_acoustic_embeds.masked_fill(~input_mask_expand_dim, 0) + ys_pad_embed.masked_fill(
             input_mask_expand_dim, 0)
-        return sematic_embeds * tgt_mask, decoder_out * tgt_mask, pre_loss_att
+        return sematic_embeds * tgt_mask, decoder_out * tgt_mask, pre_loss_att, crf_ner_loss
 
-
-    def sampler(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds):
+    def sampler(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds, ne_labels=None, bert_input=None):
         tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())[:, :, None]).to(ys_pad.device)
         ys_pad_masked = ys_pad * tgt_mask[:, :, 0]
 
         ys_pad_embed, _ = self.decoder.embed(ys_pad_masked)
+        if self.add_ne_feat and ne_labels is not None:
+            ys_pad_embed += self.decoder.ne_lstm(ne_labels)
+        if self.add_bert_feat and bert_input is not None:
+            ys_pad_embed += self.decoder.bert_embed(bert_input)
 
         with torch.no_grad():
             decoder_outs = self.decoder(
                 pre_acoustic_embeds, tgt_mask.squeeze(-1), encoder_out, encoder_mask.squeeze(1))
-            decoder_out, _ = decoder_outs[0], decoder_outs[1]
+            crf_ner_loss = None
+            decoder_out, _, ner_score = decoder_outs[0], decoder_outs[1], decoder_outs[2]
             pred_tokens = decoder_out.argmax(-1)
             nonpad_positions = ys_pad.ne(self.ignore_id)
             seq_lens = (nonpad_positions).sum(1)
@@ -1590,6 +1633,36 @@ class ParaformerASRModel(torch.nn.Module):
             input_mask_expand_dim, 0)
         return sematic_embeds * tgt_mask, decoder_out * tgt_mask
     
+    def my_sampler_with_grad(self, encoder_out, encoder_mask, ys_pad, ys_pad_lens, pre_acoustic_embeds, ne_labels=None, bert_input=None):
+        tgt_mask = (~make_pad_mask(ys_pad_lens, max_len=ys_pad_lens.max())[:, :, None]).to(ys_pad.device)
+        ys_pad_masked = ys_pad * tgt_mask[:, :, 0]
+
+        ys_pad_embed, _ = self.decoder.embed(ys_pad_masked)
+        if self.add_ne_feat and ne_labels is not None:
+            ys_pad_embed += self.decoder.ne_lstm(ne_labels)
+        if self.add_bert_feat and bert_input is not None:
+            ys_pad_embed += self.decoder.bert_embed(bert_input)
+        decoder_outs = self.decoder(
+                pre_acoustic_embeds, tgt_mask.squeeze(-1), encoder_out, encoder_mask.squeeze(1))
+        crf_ner_loss = None
+        if self.e2e_ner:
+            crf_ner_loss = self.decoder.ner_head.loss(decoder_outs[2], ne_labels, tgt_mask.squeeze(-1))
+        
+        pre_loss_att = self.criterion_att(decoder_outs[0], ys_pad)
+
+        decoder_out, _, ne_score = decoder_outs[0], decoder_outs[1], decoder_outs[2]
+        pred_tokens = decoder_out.argmax(-1)
+        nonpad_positions = ys_pad.ne(self.ignore_id)
+        seq_lens = (nonpad_positions).sum(1)
+        # diff_mask: (B, L), pre_acoustic_embeds: (B, L, dim)
+        diff_mask = (pred_tokens != ys_pad) & nonpad_positions
+        same_mask = (pred_tokens == ys_pad) & nonpad_positions
+        # replace pre_acoustic_embeds with ys_pad_embed based on diff_mask
+        sematic_embeds = pre_acoustic_embeds.masked_scatter(same_mask.unsqueeze(-1), ys_pad_embed[same_mask])
+
+        return sematic_embeds * tgt_mask, decoder_out * tgt_mask, pre_loss_att, crf_ner_loss
+        
+
     def calc_predictor(self, encoder_out, encoder_out_lens):
         
         encoder_out_mask = (~make_pad_mask(encoder_out_lens, max_len=encoder_out.size(1))[:, None, :]).to(
@@ -1604,6 +1677,11 @@ class ParaformerASRModel(torch.nn.Module):
         )
         decoder_out = decoder_outs[0]
         decoder_out = torch.log_softmax(decoder_out, dim=-1)
+
+        if self.e2e_ner:
+            ner_score = decoder_outs[2]
+            return decoder_out, semantic_mask.sum(-1), ner_score
+
         return decoder_out, semantic_mask.sum(-1)
 
     def recognize(
@@ -1642,7 +1720,14 @@ class ParaformerASRModel(torch.nn.Module):
         decoder_out, ys_pad_lens = decoder_outs[0], decoder_outs[1]
         scores, hypos = decoder_out.max(-1)
         hypos = hypos.masked_fill(~tgt_mask, self.eos)
-        return hypos, scores
+
+        if self.e2e_ner:
+            ner_score = decoder_outs[2]
+            ner_pred = self.decoder.ner_head.decode(ner_score, tgt_mask)[0]
+            ner_pred = ner_pred.masked_fill(~tgt_mask, self.O_idx)
+            return hypos, scores, ner_pred
+
+        return hypos, scores, None
 
 def init_asr_model(configs):
     if configs['cmvn_file'] is not None:

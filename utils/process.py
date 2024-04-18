@@ -112,7 +112,6 @@ def build_context_tensor(conetxt_vocab, symbol_vocab, pad_value=-1):
     
     return pad(lst, padding_value=pad_value)
     
-
 def build_ner_vocab(data_lst):
     label_counter = Counter(en_lst[3]
                             for dic in data_lst
