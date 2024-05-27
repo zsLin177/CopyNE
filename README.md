@@ -34,7 +34,7 @@ python scripts/change_wav_path.py data_to_upload/aishell_dataset/test-ne.json da
 
 ## Training
 ```
-python -m main train --train data_to_upload/aishell_dataset/train_addne.json \
+torchrun --nnodes=1 --nproc_per_node=4 --master_port=29501 main.py train --train data_to_upload/aishell_dataset/train_addne.json \
                      --dev data_to_upload/aishell_dataset/dev_addne.json \
                      --test data_to_upload/aishell_dataset/test_addne.json \
                      --add_context \
@@ -48,14 +48,14 @@ python -m main train --train data_to_upload/aishell_dataset/train_addne.json \
                      --seed 777 \
                      --config conf/copyne.yaml \
                      --char_dict data_to_upload/aishell_vocab/char.vocab \
-                     --num_workers 6 \
-                     --device 0
+                     --cmvn data_to_upload/aishell1_global_cmvn_mel80 \
+                     --num_workers 6
 ```
 
 ## Predict and Evaluation
 ```shell
 # predict on the test-ne set
-python -m main evaluate --char_dict data_to_upload/aishell_vocab/char.vocab \
+torchrun --nnodes=1 --nproc_per_node=1 main.py evaluate --char_dict data_to_upload/aishell_vocab/char.vocab \
                      --add_context \
                      --att_type simpleatt \
                      --add_copy_loss \
@@ -67,8 +67,7 @@ python -m main evaluate --char_dict data_to_upload/aishell_vocab/char.vocab \
                      --decode_mode copy_attention \
                      --copy_threshold 0.9 \
                      --batch_size 64 \
-                     --beam_size 10 \
-                     --device 0
+                     --beam_size 10
 
 # compute CER and NE-CER
 ./compute-necer.sh data_to_upload/aishell_dataset/test-ne.text test-ne.pred.asr
