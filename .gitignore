@@ -24,3 +24,4 @@ run.sh
 
 # self file
 myselfscripts
+*.slurm
