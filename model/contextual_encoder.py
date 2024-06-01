@@ -63,7 +63,7 @@ class LSTMContextCoder(nn.Module):
         """
         if self.add_null_context:
             max_len = words.shape[1]
-            null_tensor = -words.new_ones((1, max_len), device=words.device, dtype=torch.long)
+            null_tensor = words.new_ones((1, max_len), device=words.device, dtype=torch.long) * self.pad_idx
             null_tensor[0, 0] = self.embed.weight.shape[0]-1
             words = torch.cat([words, null_tensor], 0)
 

@@ -5,7 +5,7 @@ import copy
 import torch
 import torch.nn as nn
 from model.bartsp import BartASRCorrection, BartSpeechNER
-from utils.data import Dataset, collate_fn, NERDataset, ner_collate_fn, BartSeq2SeqDataset, bartseq2seq_collate_fn, BartTxtSeq2SeqDataset, barttxtseq2seq_collate_fn, CLASDataset, clas_collate_fn, copyne_collate_fn, CopyASRDataset, copyasr_collate_fn
+from utils.data import Dataset, collate_fn, NERDataset, ner_collate_fn, BartSeq2SeqDataset, bartseq2seq_collate_fn, BartTxtSeq2SeqDataset, barttxtseq2seq_collate_fn, CLASDataset, clas_collate_fn, copyne_collate_fn, CopyASRDataset, copyasr_collate_fn, process_audio
 from torch.utils.data import RandomSampler, SequentialSampler, BatchSampler, DataLoader
 from supar.utils.logging import init_logger, logger, progress_bar, get_logger
 from wenet.transformer.asr_model import init_ctc_model, init_asr_model, init_copyasr_model, init_paraformer_model
@@ -24,6 +24,8 @@ from collections import Counter
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
+import torchaudio as ta
+from torchaudio.transforms import Resample
 
 class Parser(object):
     def __init__(self, args) -> None:
@@ -1326,9 +1328,10 @@ class CopyNEASRParser(object):
         else:
             self.model.load_state_dict(checkpoint)
 
-        self.test_context_vocab = read_context_table(self.args.test_ne_dict)
-        self.test_context_tensor = build_context_tensor(self.test_context_vocab, self.symbol_vocab, pad_value=-1)
-        self.test_context_tensor = self.test_context_tensor.to(loc)
+        if self.args.test_ne_dict != "None":
+            self.test_context_vocab = read_context_table(self.args.test_ne_dict)
+            self.test_context_tensor = build_context_tensor(self.test_context_vocab, self.symbol_vocab, pad_value=-1)
+            self.test_context_tensor = self.test_context_tensor.to(loc)
 
     def train(self):
         if self.gpu_id == 0:
@@ -1542,7 +1545,7 @@ class CopyNEASRParser(object):
                     context_tensor = self.test_context_tensor
 
                 if self.args.decode_mode == 'attention':
-                    hyps, _ = self.model.recognize(
+                    hyps, _ = self.model.module.recognize(
                     audio_feat,
                     feats_lengths,
                     beam_size=self.args.beam_size,
@@ -1559,7 +1562,7 @@ class CopyNEASRParser(object):
                     copy_threshold=self.args.copy_threshold)
                     hyps = [hyp.tolist() for hyp in hyps]
                 elif self.args.decode_mode == 'ctc_greedy_search':
-                    hyps, _ = self.model.ctc_greedy_search(
+                    hyps, _ = self.model.module.ctc_greedy_search(
                     audio_feat,
                     feats_lengths,
                     decoding_chunk_size=-1,
@@ -1587,6 +1590,72 @@ class CopyNEASRParser(object):
                     fasr.write('{} {}\n'.format(key, asr_res))
         elapsed = datetime.now() - start
         print(f"{elapsed}s elapsed, {len(dataset) / elapsed.total_seconds():.2f} Sents/s")
+
+    @torch.no_grad()
+    def api(self, audio_file, ne_vocab_file, copy_threshold=0.9):
+        self.model.eval()
+        data_file_path = process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_dir="tmp_dir")
+
+        is_train = False
+        is_dev = False
+        is_test = True
+
+        if ne_vocab_file != "None":
+            self.test_context_vocab = read_context_table(ne_vocab_file)
+            self.test_context_tensor = build_context_tensor(ne_vocab_file, self.symbol_vocab, pad_value=-1)
+            loc = f"cuda:{self.gpu_id}"
+            self.test_context_tensor = self.test_context_tensor.to(loc)
+
+        dataset = CLASDataset(data_file_path, self.args.char_dict, self.args.test_ne_dict, is_training=is_train, is_dev=is_dev, is_test=is_test,  frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num, add_context=True, pad_context=self.args.pad_context)
+        dataloader = DataLoader(dataset,
+                                collate_fn=copyne_collate_fn,
+                                batch_sampler=BatchSampler(SequentialSampler(dataset),
+                                batch_size=16,
+                                drop_last=False),
+                                num_workers=3
+        )
+        char_dict = {v:k for k, v in dataset.char_dict.items()}
+        eos = len(char_dict) - 1
+        bar = progress_bar(dataloader)
+
+        all_res_s = ""
+        if is_test:
+            context = self.model.module.concoder(self.test_context_tensor)
+        start = datetime.now()
+        for i, dic in enumerate(bar, 1):
+            audio_feat = dic['audio_feat']
+            feats_lengths = dic['audio_feat_length']
+            keys = dic['keys']
+            audio_feat = audio_feat.to(self.gpu_id)
+            feats_lengths = feats_lengths.to(self.gpu_id)
+            context_tensor = self.test_context_tensor
+
+            hyps, _ = self.model.module.copy_recognize(
+                    audio_feat,
+                    feats_lengths,
+                    beam_size=self.args.beam_size,
+                    context=context, 
+                    context_tensor=context_tensor,
+                    copy_threshold=copy_threshold)
+            hyps = [hyp.tolist() for hyp in hyps]
+
+            for i, key in enumerate(keys):
+                content = []
+                for w in hyps[i]:
+                    if w == eos:
+                        break
+                    if char_dict[w] == '<unk>':
+                        content.append("<unk>")
+                    else:
+                        content.append(char_dict[w])
+                asr_res = ''.join(content)
+                all_res_s += asr_res
+
+        elapsed = datetime.now() - start
+        print(f"{elapsed}s elapsed, {len(dataset) / elapsed.total_seconds():.2f} Sents/s")
+        os.removedirs("tmp_dir")
+        return all_res_s
+
 
 class CopyASRPaser(object):
     """_summary_

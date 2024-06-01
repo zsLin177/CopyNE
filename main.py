@@ -5,6 +5,7 @@ from supar.utils.logging import init_logger, logger
 import os
 import torch
 from torch.distributed import init_process_group, destroy_process_group
+from web_demo import create_demo
 
 def ddp_setup():
     init_process_group(backend="nccl")
@@ -61,7 +62,7 @@ def parse(parser):
                         type=float)
     parser.add_argument('--train_ne_dict', default='data/end2end/aishell_train_ner_most-all.vocab')
     parser.add_argument('--dev_ne_dict', default='data/end2end/aishell_dev_ner_random-500.vocab')
-    parser.add_argument('--att_type', default='contextual', type=str, choices=['contextual', 'crossatt', 'simpleatt'])
+    parser.add_argument('--att_type', default='simpleatt', type=str, choices=['contextual', 'crossatt', 'simpleatt'])
     parser.add_argument('--add_copy_loss', action='store_true')
     parser.add_argument('--no_concat', action='store_true')
     parser.add_argument('--use_avg', action='store_true')
@@ -97,6 +98,11 @@ def parse(parser):
                 parser = CopyNEASRParser(args)
         logger.info(f'{parser.model}\n')
         parser.eval()
+    elif args.mode == 'api':
+        assert args.add_context
+        assert args.add_copy_loss
+        parser = CopyNEASRParser(args)
+        
     destroy_process_group()
 
 
@@ -117,6 +123,9 @@ if __name__ == '__main__':
     subparser.add_argument('--decode_mode', choices=['attention', 'ctc_greedy_search', 'copy_attention'], help='decoding mode to use')
     subparser.add_argument('--beam_size', default=10, type=int, help='beam size')
     subparser.add_argument('--copy_threshold', default=0.9, type=float, help='threshold for copying')
+
+    subparser = subparsers.add_parser('api', help='API')
+    subparser.add_argument('--test_ne_dict', default='None')
 
     parse(parser)
     

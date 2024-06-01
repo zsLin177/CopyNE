@@ -6,10 +6,48 @@ import re
 from utils.process import read_json, read_symbol_table, build_ner_vocab, read_context_table
 from supar.utils.fn import pad
 from supar.utils.field import SubwordField
+import os
+import json
 
 per_regex = '\[.+?\]'
 loc_regex = '\(.+?\)'
 org_regex = '\<.+?\>'
+
+def process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_dir = "temp_audio_dir"):
+    os.mkdir(tmp_dir)
+    wavform, sample_rate = ta.load(audio_file)
+    # resample to 16k
+    resampler = ta.transforms.Resample(orig_freq=sample_rate, new_freq=tgt_sample_rate)
+    waveform = resampler(waveform)
+    sample_rate = tgt_sample_rate
+
+    # split
+    segment_length_samples = int(sample_rate * segment_length_sec)
+    num_segments = (waveform.size(1) + segment_length_samples - 1) // segment_length_samples
+    segments = []
+    for i in range(num_segments):
+        start = i * segment_length_samples
+        end = min((i + 1) * segment_length_samples, waveform.size(1))
+        segment = waveform[:, start:end]
+        segments.append(segment)
+    
+    jsonl_file_path = os.path.join(tmp_dir, "segs.jsonl")
+    data = []
+    for i, segment in enumerate(segments):
+        ta.save(os.path.join(tmp_dir, f'segment_{i}.wav'), segment)
+        key = f"segment_{i}"
+        wav = os.path.join(tmp_dir, f'segment_{i}.wav')
+        txt = "sudo-txt"
+        data.append({"key":key,
+                     "wav":wav,
+                     "txt":txt,
+                     "ne_lst":[]
+                     })
+    with open(jsonl_file_path, "w", encoding="utf8") as f:
+        for dic in data:
+            f.write(json.dumps(dic, ensure_ascii=False)+"\n")
+    
+    return jsonl_file_path
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, json_file, char_dict_file, num_mel_bins=80, frame_length=25, frame_shift=10, max_frame_num=100000, speed_perturb=False, spec_aug=False, bert_tokenizer=None, e2ener=False, use_same_tokenizer=False, add_context=False, add_ne_feat=False, nelabel_dict_file=None, add_bert_feat=False) -> None:
