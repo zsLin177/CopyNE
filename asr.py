@@ -1316,6 +1316,14 @@ class CopyNEASRParser(object):
                 path = os.path.join(self.args.path, 'best.model')
             self.load_model(path)
         
+        elif self.args.mode == "api":
+            if self.args.use_avg:
+                path = os.path.join(self.args.path, 'avg.model')
+            else:
+                path = os.path.join(self.args.path, 'best.model')
+            self.load_model(path)
+
+        
         self.model = DDP(self.model, device_ids=[self.gpu_id], find_unused_parameters=True)
 
     def load_model(self, model_path):
@@ -1602,15 +1610,15 @@ class CopyNEASRParser(object):
 
         if ne_vocab_file != "None":
             self.test_context_vocab = read_context_table(ne_vocab_file)
-            self.test_context_tensor = build_context_tensor(ne_vocab_file, self.symbol_vocab, pad_value=-1)
+            self.test_context_tensor = build_context_tensor(self.test_context_vocab, self.symbol_vocab, pad_value=-1)
             loc = f"cuda:{self.gpu_id}"
             self.test_context_tensor = self.test_context_tensor.to(loc)
 
-        dataset = CLASDataset(data_file_path, self.args.char_dict, self.args.test_ne_dict, is_training=is_train, is_dev=is_dev, is_test=is_test,  frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num, add_context=True, pad_context=self.args.pad_context)
+        dataset = CLASDataset(data_file_path, self.args.char_dict, ne_vocab_file, is_training=is_train, is_dev=is_dev, is_test=is_test,  frame_length=self.args.frame_length, frame_shift=self.args.frame_shift, max_frame_num=self.args.max_frame_num, add_context=True, pad_context=self.args.pad_context)
         dataloader = DataLoader(dataset,
                                 collate_fn=copyne_collate_fn,
                                 batch_sampler=BatchSampler(SequentialSampler(dataset),
-                                batch_size=16,
+                                batch_size=self.args.batch_size,
                                 drop_last=False),
                                 num_workers=3
         )
@@ -1653,7 +1661,6 @@ class CopyNEASRParser(object):
 
         elapsed = datetime.now() - start
         print(f"{elapsed}s elapsed, {len(dataset) / elapsed.total_seconds():.2f} Sents/s")
-        os.removedirs("tmp_dir")
         return all_res_s
 
 

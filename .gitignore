@@ -25,3 +25,4 @@ run.sh
 # self file
 myselfscripts
 *.slurm
+tmp_dir
