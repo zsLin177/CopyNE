@@ -1600,9 +1600,9 @@ class CopyNEASRParser(object):
         print(f"{elapsed}s elapsed, {len(dataset) / elapsed.total_seconds():.2f} Sents/s")
 
     @torch.no_grad()
-    def api(self, audio_file, ne_vocab_file, copy_threshold=0.9):
+    def api(self, audio_file, ne_vocab_file, copy_threshold=0.9, tmp_dir="tmp_dir"):
         self.model.eval()
-        data_file_path = process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_dir="tmp_dir")
+        data_file_path = process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_dir=tmp_dir)
 
         is_train = False
         is_dev = False

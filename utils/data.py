@@ -50,7 +50,10 @@ def process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_
     
     return jsonl_file_path
 
-def make_ne_vocab_file(input_s, input_type):
+def make_ne_vocab_file(input_s, input_type, tmp_dir="tmp_dir"):
+    if not os.path.exists(tmp_dir):
+        os.mkdir(tmp_dir)
+
     if input_type == "File":
         dic = {}
         with open(input_s, "r", encoding="utf8") as f:
@@ -60,9 +63,10 @@ def make_ne_vocab_file(input_s, input_type):
                 word = line.strip()
                 if word not in dic:
                     dic[word] = len(dic)
-        with open(input_s, "w", encoding="utf8") as f:
+        file_path = os.path.join(tmp_dir, "tmp_ne_vocab.json")
+        with open(file_path, "w", encoding="utf8") as f:
             json.dump(dic, f, ensure_ascii=False)
-        return input_s
+        return file_path
     else:
         assert type(input_s) == str
         dic = {}
@@ -84,9 +88,10 @@ def make_ne_vocab_file(input_s, input_type):
             # only one
             word = input_s.strip()
             dic[word] = 0
-        with open("tmp_dir/tmp_ne_vocab.json", "w", encoding="utf8") as f:
+        file_path = os.path.join(tmp_dir, "tmp_ne_vocab.json")
+        with open(file_path, "w", encoding="utf8") as f:
             json.dump(dic, f, ensure_ascii=False)
-        return "tmp_dir/tmp_ne_vocab.json"
+        return file_path
 
 
 

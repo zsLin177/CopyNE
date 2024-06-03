@@ -7,6 +7,8 @@ from supar.utils.logging import init_logger, logger
 from torch.distributed import init_process_group, destroy_process_group
 from utils.data import make_ne_vocab_file
 import torchaudio
+import random
+import shutil
 
 def ddp_setup():
     init_process_group(backend="nccl")
@@ -73,15 +75,18 @@ def parse(parser):
 
         # 定义处理上传的音频和词典文件的函数
         def process_audio(audio_file_path, dictionary_input_text, dictionary_input_file, input_type, copy_threshold=0.9):
+            random_dir_path = "tmp_dir" + str(random.randint(0, 999999))
             if input_type == "File":
                 with open(dictionary_input_file.name, 'r', encoding='utf-8') as f:
                     dictionary_content = f.read()
-                dictionary_file_path = make_ne_vocab_file(dictionary_input_file, input_type)
+                dictionary_file_path = make_ne_vocab_file(dictionary_input_file, input_type, tmp_dir=random_dir_path)
             else:
                 dictionary_content = dictionary_input_text
-                dictionary_file_path = make_ne_vocab_file(dictionary_input_text, input_type)
+                dictionary_file_path = make_ne_vocab_file(dictionary_input_text, input_type, tmp_dir=random_dir_path)
             # 调用ASR模型进行转录
-            transcription = parser.api(audio_file_path, dictionary_file_path, copy_threshold)
+            transcription = parser.api(audio_file_path, dictionary_file_path, copy_threshold, tmp_dir=random_dir_path)
+            # del the dir
+            shutil.rmtree(random_dir_path)
             return transcription, dictionary_content
 
         # 创建Gradio界面
