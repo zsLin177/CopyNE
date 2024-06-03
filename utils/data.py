@@ -61,7 +61,7 @@ def make_ne_vocab_file(input_s, input_type):
                 if word not in dic:
                     dic[word] = len(dic)
         with open(input_s, "w", encoding="utf8") as f:
-            json.dump(dic, f)
+            json.dump(dic, f, ensure_ascii=False)
         return input_s
     else:
         assert type(input_s) == str
@@ -85,7 +85,7 @@ def make_ne_vocab_file(input_s, input_type):
             word = input_s.strip()
             dic[word] = 0
         with open("tmp_dir/tmp_ne_vocab.json", "w", encoding="utf8") as f:
-            json.dump(dic, f)
+            json.dump(dic, f, ensure_ascii=False)
         return "tmp_dir/tmp_ne_vocab.json"
 
 
