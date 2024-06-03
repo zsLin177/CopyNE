@@ -1,11 +1,12 @@
 import argparse
-
-from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParser, ParaformerASRParser
-from supar.utils.logging import init_logger, logger
 import os
 import torch
-from torch.distributed import init_process_group, destroy_process_group
 import gradio as gr
+from asr import CTCAttentionASRParser, CLASCTCAttentionASRParser, CopyNEASRParser, ParaformerASRParser
+from supar.utils.logging import init_logger, logger
+from torch.distributed import init_process_group, destroy_process_group
+from utils.data import make_ne_vocab_file
+import torchaudio
 
 def ddp_setup():
     init_process_group(backend="nccl")
@@ -15,59 +16,26 @@ def parse(parser):
     ddp_setup()
     parser.add_argument('--path', help='path to model file')
     parser.add_argument('--pre_model', type=str, default="None")
-    parser.add_argument('--seed',
-                        '-s',
-                        default=1,
-                        type=int,
-                        help='seed for generating random numbers')
-    parser.add_argument('--batch_size',
-                        default=16,
-                        type=int,
-                        help='batch size')
-    parser.add_argument('--num_workers',
-                        default=1,
-                        type=int)
-    parser.add_argument('--e2ener', 
-                        action='store_true',
-                        help='whether it is an e2ener model')
-    parser.add_argument('--char_dict', 
-                        default='data/sp_ner/chinese_char.txt', 
-                        help='path to the char dict file')
-    parser.add_argument('--cmvn', 
-                        default='data_to_upload/aishell1_global_cmvn_mel80', 
-                        help='global cmvn file')
-    parser.add_argument('--config', 
-                        default='conf/ctc_mel80.yaml', 
-                        help='config file')
-    parser.add_argument('--add_bert',
-                        action='store_true', 
-                        help='whether to add bert')
-    parser.add_argument('--bert', 
-                        default='bert-base-chinese', 
-                        help='which bert model to use')
-    parser.add_argument('--frame_length',
-                        default=25,
-                        type=int)
-    parser.add_argument('--frame_shift',
-                        default=10,
-                        type=int)
-    parser.add_argument('--max_frame_num',
-                        default=10000,
-                        type=int)
-    parser.add_argument('--add_context', 
-                        action='store_true',
-                        help='whether to add context')
-    parser.add_argument('--pad_context',
-                        default=3,
-                        type=float)
+    parser.add_argument('--seed', '-s', default=1, type=int, help='seed for generating random numbers')
+    parser.add_argument('--batch_size', default=16, type=int, help='batch size')
+    parser.add_argument('--num_workers', default=1, type=int)
+    parser.add_argument('--e2ener', action='store_true', help='whether it is an e2ener model')
+    parser.add_argument('--char_dict', default='data/sp_ner/chinese_char.txt', help='path to the char dict file')
+    parser.add_argument('--cmvn', default='data_to_upload/aishell1_global_cmvn_mel80', help='global cmvn file')
+    parser.add_argument('--config', default='conf/ctc_mel80.yaml', help='config file')
+    parser.add_argument('--add_bert', action='store_true', help='whether to add bert')
+    parser.add_argument('--bert', default='bert-base-chinese', help='which bert model to use')
+    parser.add_argument('--frame_length', default=25, type=int)
+    parser.add_argument('--frame_shift', default=10, type=int)
+    parser.add_argument('--max_frame_num', default=10000, type=int)
+    parser.add_argument('--add_context', action='store_true', help='whether to add context')
+    parser.add_argument('--pad_context', default=3, type=float)
     parser.add_argument('--train_ne_dict', default='data/end2end/aishell_train_ner_most-all.vocab')
     parser.add_argument('--dev_ne_dict', default='data/end2end/aishell_dev_ner_random-500.vocab')
     parser.add_argument('--att_type', default='simpleatt', type=str, choices=['contextual', 'crossatt', 'simpleatt'])
     parser.add_argument('--add_copy_loss', action='store_true')
     parser.add_argument('--no_concat', action='store_true')
     parser.add_argument('--use_avg', action='store_true')
-
-    
 
     args, unknown = parser.parse_known_args()
     args, _ = parser.parse_known_args(unknown, args)
@@ -104,15 +72,18 @@ def parse(parser):
         parser = CopyNEASRParser(args)
 
         # 定义处理上传的音频和词典文件的函数
-        def process_audio(audio_file_path, dictionary_file):
-            # 从上传的词典文件中读取词典
-            # dictionary = dictionary_file.read().decode("utf-8")
-            
+        def process_audio(audio_file_path, dictionary_input_text, dictionary_input_file, input_type, copy_threshold=0.9):
+            if input_type == "File":
+                with open(dictionary_input_file.name, 'r', encoding='utf-8') as f:
+                    dictionary_content = f.read()
+                dictionary_file_path = make_ne_vocab_file(dictionary_input_file, input_type)
+            else:
+                dictionary_content = dictionary_input_text
+                dictionary_file_path = make_ne_vocab_file(dictionary_input_text, input_type)
             # 调用ASR模型进行转录
-            transcription = parser.api(audio_file_path, dictionary_file)
-            
-            return transcription
-        
+            transcription = parser.api(audio_file_path, dictionary_file_path, copy_threshold)
+            return transcription, dictionary_content
+
         # 创建Gradio界面
         with gr.Blocks() as demo:
             # 使用HTML和CSS添加动态效果
@@ -140,7 +111,7 @@ def parse(parser):
                 overflow: hidden;
                 white-space: nowrap;
                 font-size: 1.5em;
-                animation: typing 4s steps(40, end), blink-caret .75s step-end infinite;
+                animation: typing 10s steps(40, end), blink-caret 2.5s step-end infinite;
             }
             @keyframes blink-caret {
                 from, to { border-color: transparent; }
@@ -179,22 +150,40 @@ def parse(parser):
                 with gr.Column():
                     gr.Markdown("#### 上传音频文件或使用麦克风录制")
                     audio_input = gr.Audio(type="filepath", label="音频文件")
-                    gr.Markdown("#### 上传用户词典文件")
-                    dictionary_input = gr.File(label="词典文件")
-                    submit_button = gr.Button("开始转录")
+                    
+                    gr.Markdown("#### 选择词典输入方式")
+                    input_type = gr.Radio(choices=["Text", "File"], label="输入方式", value="Text")
+
+                    text_input = gr.Textbox(label="词典内容, 以逗号间隔", placeholder="在此处输入词典内容", visible=True)
+                    file_input = gr.File(label="词典文件，每行一个词", visible=False, type="filepath")
+
+                    gr.Markdown("#### 词典内容")
+                    dictionary_display = gr.Textbox(label="", placeholder="词典内容将显示在这里", lines=10, interactive=False)
                 
                 with gr.Column():
+                    gr.Markdown("#### Copy Threshold (推荐0.9)")
+                    threshold_slider = gr.Slider(minimum=0, maximum=1, step=0.01, label="阈值")
+
                     gr.Markdown("#### 转录结果")
                     output = gr.Textbox(label="", placeholder="转录结果将显示在这里", lines=10)
+
+                    submit_button = gr.Button("开始转录")
             
-            submit_button.click(process_audio, inputs=[audio_input, dictionary_input], outputs=output)
+            # 根据选择的输入方式显示相应的输入组件
+            def toggle_inputs(input_type):
+                if input_type == "Text":
+                    return gr.update(visible=True), gr.update(visible=False)
+                else:
+                    return gr.update(visible=False), gr.update(visible=True)
+                    
+            input_type.change(toggle_inputs, inputs=input_type, outputs=[text_input, file_input])
+
+            submit_button.click(process_audio, inputs=[audio_input, text_input, file_input, input_type, threshold_slider], outputs=[output, dictionary_display])
 
         # 运行Gradio应用
         demo.launch()
-        
+
     destroy_process_group()
-
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(allow_abbrev=False)
@@ -218,4 +207,3 @@ if __name__ == '__main__':
     subparser.add_argument('--beam_size', default=10, type=int, help='beam size')
 
     parse(parser)
-    

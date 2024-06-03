@@ -13,9 +13,10 @@ per_regex = '\[.+?\]'
 loc_regex = '\(.+?\)'
 org_regex = '\<.+?\>'
 
-def process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_dir = "temp_audio_dir"):
-    os.mkdir(tmp_dir)
-    wavform, sample_rate = ta.load(audio_file)
+def process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_dir = "tmp_dir"):
+    if not os.path.exists(tmp_dir):
+        os.mkdir(tmp_dir)
+    waveform, sample_rate = ta.load(audio_file)
     # resample to 16k
     resampler = ta.transforms.Resample(orig_freq=sample_rate, new_freq=tgt_sample_rate)
     waveform = resampler(waveform)
@@ -34,7 +35,7 @@ def process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_
     jsonl_file_path = os.path.join(tmp_dir, "segs.jsonl")
     data = []
     for i, segment in enumerate(segments):
-        ta.save(os.path.join(tmp_dir, f'segment_{i}.wav'), segment)
+        ta.save(os.path.join(tmp_dir, f'segment_{i}.wav'), segment, tgt_sample_rate)
         key = f"segment_{i}"
         wav = os.path.join(tmp_dir, f'segment_{i}.wav')
         txt = "sudo-txt"
@@ -48,6 +49,46 @@ def process_audio(audio_file, segment_length_sec=10, tgt_sample_rate=16000, tmp_
             f.write(json.dumps(dic, ensure_ascii=False)+"\n")
     
     return jsonl_file_path
+
+def make_ne_vocab_file(input_s, input_type):
+    if input_type == "File":
+        dic = {}
+        with open(input_s, "r", encoding="utf8") as f:
+            for line in f.readlines():
+                if len(line) == 0:
+                    continue
+                word = line.strip()
+                if word not in dic:
+                    dic[word] = len(dic)
+        with open(input_s, "w", encoding="utf8") as f:
+            json.dump(dic, f)
+        return input_s
+    else:
+        assert type(input_s) == str
+        dic = {}
+        if "," in input_s:
+            for word in input_s.strip().split(","):
+                word = word.strip()
+                if len(word) == 0:
+                    continue
+                if word not in dic:
+                    dic[word] = len(dic)
+        elif "，" in input_s:
+            for word in input_s.strip().split("，"):
+                word = word.strip()
+                if len(word) == 0:
+                    continue
+                if word not in dic:
+                    dic[word] = len(dic)
+        else:
+            # only one
+            word = input_s.strip()
+            dic[word] = 0
+        with open("tmp_dir/tmp_ne_vocab.json", "w", encoding="utf8") as f:
+            json.dump(dic, f)
+        return "tmp_dir/tmp_ne_vocab.json"
+
+
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, json_file, char_dict_file, num_mel_bins=80, frame_length=25, frame_shift=10, max_frame_num=100000, speed_perturb=False, spec_aug=False, bert_tokenizer=None, e2ener=False, use_same_tokenizer=False, add_context=False, add_ne_feat=False, nelabel_dict_file=None, add_bert_feat=False) -> None:

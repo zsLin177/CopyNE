@@ -1,5 +1,5 @@
 # CopyNE: Better Contextual ASR by Copying Named Entities
-This is the repo for CopyNE, a novel approach for contextual ASR. The paper can be found at [here](https://arxiv.org/abs/2305.12839).
+This is the repo for CopyNE, a novel approach for contextual ASR. The paper has been accepted in ACL 2024. It can be found at [here](https://arxiv.org/abs/2305.12839).
 
 ## Abstract
 End-to-end automatic speech recognition (ASR) systems have made significant progress in general scenarios. 
@@ -72,6 +72,23 @@ torchrun --nnodes=1 --nproc_per_node=1 main.py evaluate --char_dict data_to_uplo
 # compute CER and NE-CER
 ./compute-necer.sh data_to_upload/aishell_dataset/test-ne.text test-ne.pred.asr
 ```
+
+## Web Demo
+We provide a web demo for CopyNE. You can upload or record your own audio and set personalized context dictionary.
+You can run the following command to start the web demo. The demo is based on Gradio. The demo will run at http://127.0.0.1:7860.
+```shell
+CUDA_VISIBLE_DEVICES=0 torchrun --nnodes=1 --nproc_per_node=1 main.py api --char_dict data_to_upload/multi_char.vocab \
+                     --add_context \
+                     --add_copy_loss \
+                     --config conf/copyne-conformer.yaml \
+                     --path dir_path_of_model \
+                     --use_avg
+```
+
+Example of the web demo:
+<img src="imgs/web_demo.png" width="800" height="400">
+
+
 
 ## Acknowledge
 1. We borrowed some code from [wenet](https://github.com/wenet-e2e/wenet) for some speech processing and modeling.
